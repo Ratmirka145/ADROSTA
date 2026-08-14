@@ -37,8 +37,9 @@ flowchart LR
     C -->|"POST /api/orders + Idempotency-Key"| A["FastAPI"]
     A --> V["Pydantic: проверка и нормализация"]
     V --> S["Сервис заказа"]
-    S -->|"SKU + boxes"| DB[("SQLite: доверенный каталог")]
-    S -->|"одна транзакция"| O[("заказ, снимок товара, idempotency, outbox")]
+    S -->|"SKU + boxes"| DB[("SQLite: товары и price tiers")]
+    S --> D["Единый domain calculator"]
+    D -->|"рассчитанный snapshot"| O[("заказ, снимок товара, idempotency, outbox")]
     O --> A
     O --> W["Python worker"]
     W -->|"HTTPS webhook, повторные попытки"| X["Tilda / CRM / почтовый шлюз / другой сервис"]
@@ -52,10 +53,11 @@ flowchart LR
 | `app/config.py` | Типизированная загрузка и проверка env, строгие production-ограничения |
 | `app/schemas.py` | Строгий публичный контракт заказа, телефон/email и условные поля |
 | `app/routers/orders.py` | `POST /api/orders` |
+| `app/routers/cart.py` | Предварительный `POST /api/cart/calculate` без записи заказа |
 | `app/routers/health.py` | Liveness `GET /health` и readiness `GET /ready` |
 | `app/database.py` | Схема SQLite, WAL, foreign keys и транзакции |
 | `app/repositories.py` | Каталог, заказ, снимки характеристик, дедупликация, rate limit, outbox |
-| `app/domain.py` | Чистые правила доверенных характеристик и расчёта груза |
+| `app/domain.py` | Единственный расчёт цены, количества, груза и totals |
 | `app/services.py` | Оркестрация заказа и фоновой доставки |
 | `app/container.py` | Сборка зависимостей приложения и worker |
 | `app/integrations.py` | Универсальный server-to-server webhook без предположений о CRM |
@@ -76,7 +78,7 @@ flowchart LR
 - строгий выбор получения заказа: самовывоз либо СДЭК до ПВЗ/двери;
 - приём от клиента только `sku` и `boxes` для каждой позиции;
 - точный, регистрозависимый поиск активного SKU в SQLite;
-- серверный пересчёт веса, объёма и габаритов из доверенного каталога;
+- серверный расчёт units, SKU-specific price tier, точной цены в копейках, веса, объёма и грузовых мест;
 - атомарное сохранение заказа и снимка характеристик товара на момент заказа;
 - обязательный `Idempotency-Key`, повтор ответа на безопасный retry и защита от похожего повторного заказа;
 - SQLite rate limit по HMAC-отпечатку IP;
@@ -88,7 +90,6 @@ flowchart LR
 ### Что намеренно не реализовано без исходных данных
 
 - конкретный адаптер CRM/Tilda/email: доступен только универсальный webhook;
-- реальные SKU, названия, вес и размеры коробок;
 - публичный API-домен, TLS/reverse proxy и настройки конкретного хостинга;
 - правки существующей формы Tilda: её HTML/CSS/JS не было в архиве;
 - административный интерфейс, выгрузка заказов, политика удаления PII и резервное копирование как сервис.
@@ -114,11 +115,11 @@ Copy-Item .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Инициализируйте базу и добавьте хотя бы один реальный товар:
+Инициализируйте базу и идемпотентно загрузите реальный каталог ADROSTA:
 
 ```powershell
 python -m app.cli init-db
-python -m app.cli product upsert --sku "REAL-SKU" --name "Название товара" --weight-grams 12500 --length-mm 600 --width-mm 400 --height-mm 250
+python -m app.cli catalog seed-adrosta
 python -m app.cli product list
 ```
 
@@ -145,6 +146,7 @@ source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 cp .env.example .env
 python -m app.cli init-db
+python -m app.cli catalog seed-adrosta
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
@@ -154,7 +156,7 @@ SQLite-файл создаётся автоматически по `DATABASE_PAT
 
 ```powershell
 # Добавить новый SKU или обновить существующий
-python -m app.cli product upsert --sku "SKU-001" --name "Товар" --weight-grams 9000 --length-mm 500 --width-mm 300 --height-mm 200
+python -m app.cli product upsert --sku "SKU-001" --name "Товар" --units-per-box 10 --weight-grams 9000 --length-mm 500 --width-mm 300 --height-mm 200
 
 # Активные товары
 python -m app.cli product list
@@ -168,6 +170,65 @@ python -m app.cli product activate --sku "SKU-001"
 ```
 
 Неактивный или отсутствующий SKU для публичного API считается неизвестным. Регистр важен: `SKU-001` и `sku-001` — разные значения.
+
+## Server-side pricing
+
+Frontend передаёт для каждой позиции только `sku` и целое `boxes >= 1`. Поля `unitsPerBox`, цены, суммы, веса, габаритов и totals запрещены входной схемой. Backend загружает из SQLite канонические `name`, `units_per_box`, вес и габариты одной коробки, затем выбирает price tier и рассчитывает позиции и итог корзины в одном `app.domain.calculate_order()`. Этот же calculator используется при предварительном расчёте и при создании заказа; repository сохраняет готовый snapshot и не выбирает тариф.
+
+Команда `python -m app.cli catalog seed-adrosta` безопасна при повторном запуске и создаёт/обновляет:
+
+- `opt-san-green` — SAN Green;
+- `opt-san-blue` — SAN Blue;
+- для обоих: 10 единиц в коробке, 10 900 г, 330 × 200 × 265 мм;
+- price tiers: 1–4 коробки → 320 ₽/ед., 5–9 → 290 ₽/ед., 10+ → 260 ₽/ед.
+
+Деньги хранятся и считаются только как integer kopecks (`32000`, `29000`, `26000`), без `float`. Tier выбирается отдельно по количеству коробок каждого SKU. Поэтому 6 Green получают 290 ₽/ед., а 4 Blue — 320 ₽/ед.; общий размер корзины 10 коробок не переводит обе позиции в tier 10+.
+
+### `POST /api/cart/calculate`
+
+Endpoint выполняет тот же server-side calculation, но не создаёт `orders`, idempotency record или outbox event.
+
+```json
+{
+  "items": [
+    {"sku": "opt-san-green", "boxes": 5}
+  ]
+}
+```
+
+Основные поля ответа:
+
+```json
+{
+  "items": [
+    {
+      "sku": "opt-san-green",
+      "name": "SAN Green",
+      "boxes": 5,
+      "unitsPerBox": 10,
+      "units": 50,
+      "pricePerUnitKopecks": 29000,
+      "pricePerBoxKopecks": 290000,
+      "lineAmountKopecks": 1450000,
+      "weightPerBoxGrams": 10900,
+      "totalWeightGrams": 54500,
+      "lengthMm": 330,
+      "widthMm": 200,
+      "heightMm": 265,
+      "cargoPlaces": 5
+    }
+  ],
+  "totals": {
+    "totalBoxes": 5,
+    "totalUnits": 50,
+    "productsAmountKopecks": 1450000,
+    "totalWeightGrams": 54500,
+    "cargoPlaces": 5
+  }
+}
+```
+
+`productsAmountKopecks` содержит только стоимость товаров. Цена доставки пока не рассчитывается: backend не обращается к API СДЭК и не создаёт фиктивный delivery amount.
 
 ## Контракт `POST /api/orders`
 
@@ -248,7 +309,7 @@ python -m app.cli product activate --sku "SKU-001"
 
 Для позиции заказа API принимает только `sku` и `boxes`. Поля цены, веса, объёма, размеров и клиентские totals будут отклонены как неизвестные. Общий предел коробок дополнительно задаёт `MAX_TOTAL_BOXES`.
 
-Успешное создание возвращает HTTP 201, `orderId`, `status=accepted`, `integrationStatus`, серверные позиции и totals. Значения `weightGrams`, `volumeMm3`, `weightKg` и `volumeM3` рассчитаны backend. Повтор того же запроса с тем же ключом возвращает сохранённый результат с HTTP 200, `replayed=true` и заголовком `Idempotency-Replayed: true`.
+Успешное создание возвращает HTTP 201, `orderId`, `status=accepted`, `integrationStatus`, серверные позиции и totals. Коммерческие snapshot-поля (`unitsPerBox`, `units`, цены и `lineAmountKopecks`) вместе с весом, объёмом и грузовыми местами рассчитаны backend. Повтор того же запроса с тем же ключом возвращает сохранённый результат с HTTP 200, `replayed=true` и заголовком `Idempotency-Replayed: true`.
 
 Статусы интеграции:
 
@@ -266,7 +327,7 @@ python -m app.cli product activate --sku "SKU-001"
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `VALIDATION_ERROR`, `UNKNOWN_SKU` |
 | 429 | `RATE_LIMITED`; время ожидания есть в `Retry-After` |
-| 503 | `CATALOG_UNAVAILABLE` или `SERVICE_UNAVAILABLE` |
+| 503 | `PRICE_TIER_NOT_FOUND`, `CATALOG_UNAVAILABLE` или `SERVICE_UNAVAILABLE` |
 
 Не показывайте ответ через `innerHTML`; используйте `textContent`. Передавая `requestId` поддержке, пользователь не раскрывает содержимое заказа.
 

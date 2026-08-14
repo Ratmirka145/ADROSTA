@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.repositories import Product
+from app.repositories import Product, ProductPriceTier
 
 
 ALLOWED_ORIGIN = "https://shop.example.test"
@@ -22,6 +22,7 @@ def _seed_products(application: FastAPI) -> None:
         Product(
             sku="ADR-001",
             name="ADROSTA test product 1",
+            units_per_box=10,
             box_weight_grams=12_500,
             box_volume_mm3=120_000_000,
             box_length_mm=600,
@@ -33,12 +34,21 @@ def _seed_products(application: FastAPI) -> None:
         Product(
             sku="ADR-002",
             name="ADROSTA test product 2",
+            units_per_box=20,
             box_weight_grams=25_000,
             box_volume_mm3=240_000_000,
             box_length_mm=800,
             box_width_mm=500,
             box_height_mm=600,
         )
+    )
+    products.replace_price_tiers(
+        "ADR-001",
+        (ProductPriceTier(1, None, 10_000),),
+    )
+    products.replace_price_tiers(
+        "ADR-002",
+        (ProductPriceTier(1, None, 20_000),),
     )
 
 

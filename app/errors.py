@@ -37,6 +37,7 @@ class ErrorCode(str, Enum):
     RATE_LIMITED = "RATE_LIMITED"
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
     CATALOG_UNAVAILABLE = "CATALOG_UNAVAILABLE"
+    PRICE_TIER_NOT_FOUND = "PRICE_TIER_NOT_FOUND"
     UPSTREAM_UNAVAILABLE = "UPSTREAM_UNAVAILABLE"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
     BAD_REQUEST = "BAD_REQUEST"
@@ -190,6 +191,15 @@ class CatalogUnavailableError(AppError):
         super().__init__(
             ErrorCode.CATALOG_UNAVAILABLE,
             "Каталог товаров временно недоступен. Попробуйте снова позже.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+class PriceTierNotFoundError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.PRICE_TIER_NOT_FOUND,
+            "Для товара не настроена цена для выбранного количества коробок.",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
@@ -586,6 +596,7 @@ __all__ = [
     "IdempotencyKeyRequiredError",
     "OrderInProgressError",
     "PayloadTooLargeError",
+    "PriceTierNotFoundError",
     "RateLimitError",
     "ServiceUnavailableError",
     "UnknownSkuError",

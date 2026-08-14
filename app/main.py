@@ -15,6 +15,7 @@ from app.observability import (
     configure_logging,
 )
 from app.rate_limit_middleware import OrderRateLimitMiddleware
+from app.routers.cart import router as cart_router
 from app.routers.health import router as health_router
 from app.routers.orders import router as orders_router
 
@@ -70,6 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.add_middleware(RequestContextMiddleware)
     install_error_handlers(application)
     application.include_router(health_router)
+    application.include_router(cart_router)
     application.include_router(orders_router)
 
     @application.get("/", tags=["system"])

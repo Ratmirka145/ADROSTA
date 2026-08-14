@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterator, Optional, Union
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 _DELIVERY_V2_COLUMNS = {
@@ -28,11 +28,35 @@ _DELIVERY_V2_COLUMNS = {
     "delivery_apartment": "TEXT",
 }
 
+_CATALOG_V3_COLUMNS = {
+    "products": {
+        "units_per_box": (
+            "INTEGER NOT NULL DEFAULT 1 "
+            "CHECK (typeof(units_per_box) = 'integer' AND units_per_box > 0)"
+        ),
+    },
+    "orders": {
+        "total_units": "INTEGER NOT NULL DEFAULT 0",
+        "products_amount_kopecks": "INTEGER NOT NULL DEFAULT 0",
+        "cargo_places": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "order_items": {
+        "units_per_box": "INTEGER NOT NULL DEFAULT 1",
+        "units": "INTEGER NOT NULL DEFAULT 0",
+        "price_per_unit_kopecks": "INTEGER NOT NULL DEFAULT 0",
+        "price_per_box_kopecks": "INTEGER NOT NULL DEFAULT 0",
+        "line_amount_kopecks": "INTEGER NOT NULL DEFAULT 0",
+        "cargo_places": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
     sku TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    units_per_box INTEGER NOT NULL
+        CHECK (typeof(units_per_box) = 'integer' AND units_per_box > 0),
     box_weight_grams INTEGER NOT NULL
         CHECK (typeof(box_weight_grams) = 'integer' AND box_weight_grams > 0),
     box_volume_mm3 INTEGER NOT NULL
@@ -54,6 +78,29 @@ CREATE TABLE IF NOT EXISTS products (
 
 CREATE INDEX IF NOT EXISTS idx_products_active_sku
     ON products(active, sku);
+
+CREATE TABLE IF NOT EXISTS product_price_tiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_sku TEXT NOT NULL REFERENCES products(sku) ON DELETE CASCADE,
+    min_boxes INTEGER NOT NULL
+        CHECK (typeof(min_boxes) = 'integer' AND min_boxes >= 1),
+    max_boxes INTEGER
+        CHECK (
+            max_boxes IS NULL OR
+            (typeof(max_boxes) = 'integer' AND max_boxes >= min_boxes)
+        ),
+    price_per_unit_kopecks INTEGER NOT NULL
+        CHECK (
+            typeof(price_per_unit_kopecks) = 'integer' AND
+            price_per_unit_kopecks > 0
+        ),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(product_sku, min_boxes, max_boxes)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_price_tiers_lookup
+    ON product_price_tiers(product_sku, min_boxes, max_boxes);
 
 CREATE TABLE IF NOT EXISTS orders (
     id TEXT PRIMARY KEY,
@@ -81,8 +128,17 @@ CREATE TABLE IF NOT EXISTS orders (
     comment TEXT,
     total_boxes INTEGER NOT NULL
         CHECK (typeof(total_boxes) = 'integer' AND total_boxes > 0),
+    total_units INTEGER NOT NULL
+        CHECK (typeof(total_units) = 'integer' AND total_units > 0),
+    products_amount_kopecks INTEGER NOT NULL
+        CHECK (
+            typeof(products_amount_kopecks) = 'integer' AND
+            products_amount_kopecks > 0
+        ),
     total_weight_grams INTEGER NOT NULL
         CHECK (typeof(total_weight_grams) = 'integer' AND total_weight_grams > 0),
+    cargo_places INTEGER NOT NULL
+        CHECK (typeof(cargo_places) = 'integer' AND cargo_places > 0),
     total_volume_mm3 INTEGER NOT NULL
         CHECK (typeof(total_volume_mm3) = 'integer' AND total_volume_mm3 > 0),
     request_fingerprint_digest TEXT NOT NULL,
@@ -110,6 +166,25 @@ CREATE TABLE IF NOT EXISTS order_items (
     product_name TEXT NOT NULL,
     boxes INTEGER NOT NULL
         CHECK (typeof(boxes) = 'integer' AND boxes > 0),
+    units_per_box INTEGER NOT NULL
+        CHECK (typeof(units_per_box) = 'integer' AND units_per_box > 0),
+    units INTEGER NOT NULL
+        CHECK (typeof(units) = 'integer' AND units > 0),
+    price_per_unit_kopecks INTEGER NOT NULL
+        CHECK (
+            typeof(price_per_unit_kopecks) = 'integer' AND
+            price_per_unit_kopecks > 0
+        ),
+    price_per_box_kopecks INTEGER NOT NULL
+        CHECK (
+            typeof(price_per_box_kopecks) = 'integer' AND
+            price_per_box_kopecks > 0
+        ),
+    line_amount_kopecks INTEGER NOT NULL
+        CHECK (
+            typeof(line_amount_kopecks) = 'integer' AND
+            line_amount_kopecks > 0
+        ),
     unit_weight_grams INTEGER NOT NULL
         CHECK (typeof(unit_weight_grams) = 'integer' AND unit_weight_grams > 0),
     unit_volume_mm3 INTEGER NOT NULL
@@ -121,6 +196,8 @@ CREATE TABLE IF NOT EXISTS order_items (
         CHECK (typeof(total_weight_grams) = 'integer' AND total_weight_grams > 0),
     total_volume_mm3 INTEGER NOT NULL
         CHECK (typeof(total_volume_mm3) = 'integer' AND total_volume_mm3 > 0),
+    cargo_places INTEGER NOT NULL
+        CHECK (typeof(cargo_places) = 'integer' AND cargo_places > 0),
     UNIQUE(order_id, line_number),
     UNIQUE(order_id, sku),
     CHECK (
@@ -280,6 +357,38 @@ class Database:
                         connection.execute(
                             f"ALTER TABLE orders ADD COLUMN {name} {column_type}"
                         )
+                for table, columns in _CATALOG_V3_COLUMNS.items():
+                    existing = {
+                        row["name"]
+                        for row in connection.execute(f"PRAGMA table_info({table})")
+                    }
+                    for name, column_type in columns.items():
+                        if name not in existing:
+                            connection.execute(
+                                f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"
+                            )
+                # Historical v2 rows had no units, price or cargo snapshots.
+                # Backfill only derivable values; unavailable historical prices
+                # remain zero instead of being guessed from today's catalog.
+                connection.execute(
+                    """
+                    UPDATE order_items SET
+                        units = boxes * units_per_box,
+                        cargo_places = boxes
+                    WHERE units = 0 OR cargo_places = 0
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE orders SET
+                        total_units = COALESCE((
+                            SELECT SUM(units) FROM order_items
+                            WHERE order_items.order_id = orders.id
+                        ), 0),
+                        cargo_places = total_boxes
+                    WHERE total_units = 0 OR cargo_places = 0
+                    """
+                )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
 
     def close(self) -> None:

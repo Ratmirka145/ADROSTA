@@ -9,12 +9,24 @@ from typing import Literal
 from uuid import UUID
 
 from app.config import ConfigError, Settings
+from app.domain import (
+    AmbiguousPriceTierError,
+    CatalogIntegrityError,
+    DuplicateSkuError as DomainDuplicateSkuError,
+    InvalidOrderItemError,
+    OrderCalculation,
+    PriceTierNotFoundError as DomainPriceTierNotFoundError,
+    UnknownSkuError as DomainUnknownSkuError,
+    calculate_order,
+)
 from app.errors import (
     CatalogUnavailableError,
+    DuplicateSkuError,
     DuplicateOrderError,
     IdempotencyConflictError as ApiIdempotencyConflictError,
     IdempotencyKeyRequiredError,
     RateLimitError,
+    PriceTierNotFoundError,
     ServiceUnavailableError,
     UnknownSkuError,
     ValidationAppError,
@@ -27,15 +39,15 @@ from app.repositories import (
     OrderItemInput,
     OrderRepository,
     OutboxRepository,
-    ProductCatalogError,
     ProductRepository,
     RateLimitResult,
     RateLimitRepository,
     RepositoryError,
-    UnknownProductError,
 )
 from app.schemas import (
     CalculatedItemResponse,
+    CartCalculateRequest,
+    OrderCalculationResponse,
     OrderCreate,
     OrderResponse,
     OrderTotalsResponse,
@@ -161,17 +173,12 @@ class OrderService:
                 retry_after=max(1, rate_limit_result.retry_after_seconds)
             )
 
-        try:
-            if self.products.count() == 0:
-                raise CatalogUnavailableError()
-        except CatalogUnavailableError:
-            raise
-        except sqlite3.Error:
-            raise CatalogUnavailableError() from None
+        calculation = self._calculate(order.items)
 
         try:
             result = self.orders.create_order(
                 self._to_draft(order),
+                calculation=calculation,
                 request_hash=fingerprint,
                 duplicate_fingerprint=fingerprint,
                 idempotency_key=idempotency_key,
@@ -180,10 +187,6 @@ class OrderService:
                 ),
                 now=now,
             )
-        except UnknownProductError:
-            raise UnknownSkuError() from None
-        except ProductCatalogError:
-            raise CatalogUnavailableError() from None
         except RepositoryIdempotencyConflictError:
             raise ApiIdempotencyConflictError() from None
         except InvalidOrderError:
@@ -208,6 +211,33 @@ class OrderService:
             created=result.created,
             replayed=result.replayed,
         )
+
+    def calculate_cart(
+        self, request: CartCalculateRequest
+    ) -> OrderCalculationResponse:
+        self._validate_runtime_limits(request)
+        return OrderCalculationResponse.from_domain(self._calculate(request.items))
+
+    def _calculate(self, items) -> OrderCalculation:
+        try:
+            if self.products.count() == 0:
+                raise CatalogUnavailableError()
+            products = self.products.fetch_catalog(item.sku for item in items)
+            return calculate_order(items, products)
+        except CatalogUnavailableError:
+            raise
+        except DomainUnknownSkuError:
+            raise UnknownSkuError() from None
+        except DomainDuplicateSkuError:
+            raise DuplicateSkuError() from None
+        except InvalidOrderItemError:
+            raise ValidationAppError() from None
+        except DomainPriceTierNotFoundError:
+            raise PriceTierNotFoundError() from None
+        except (AmbiguousPriceTierError, CatalogIntegrityError):
+            raise CatalogUnavailableError() from None
+        except sqlite3.Error:
+            raise CatalogUnavailableError() from None
 
     def readiness(self) -> ReadinessResult:
         checks = {
@@ -235,7 +265,7 @@ class OrderService:
             checks["destination"] = "required"
         return ReadinessResult(ready=ready, checks=checks)
 
-    def _validate_runtime_limits(self, order: OrderCreate) -> None:
+    def _validate_runtime_limits(self, order) -> None:
         if len(order.items) > self.settings.max_order_items:
             raise ValidationAppError()
         total_boxes = 0
@@ -308,23 +338,33 @@ class OrderService:
         items = [
             CalculatedItemResponse(
                 sku=item.sku,
+                name=item.product_name,
                 boxes=item.boxes,
-                box_weight_grams=item.unit_weight_grams,
+                units_per_box=item.units_per_box,
+                units=item.units,
+                price_per_unit_kopecks=item.price_per_unit_kopecks,
+                price_per_box_kopecks=item.price_per_box_kopecks,
+                line_amount_kopecks=item.line_amount_kopecks,
+                weight_per_box_grams=item.unit_weight_grams,
+                total_weight_grams=item.total_weight_grams,
                 box_volume_mm3=item.unit_volume_mm3,
                 length_mm=item.box_length_mm,
                 width_mm=item.box_width_mm,
                 height_mm=item.box_height_mm,
-                weight_grams=item.total_weight_grams,
-                volume_mm3=item.total_volume_mm3,
+                cargo_places=item.cargo_places,
+                total_volume_mm3=item.total_volume_mm3,
                 weight_kg=(Decimal(item.total_weight_grams) / _GRAMS_PER_KILOGRAM),
                 volume_m3=(Decimal(item.total_volume_mm3) / _MM3_PER_M3),
             )
             for item in stored.items
         ]
         totals = OrderTotalsResponse(
-            boxes=stored.total_boxes,
-            weight_grams=stored.total_weight_grams,
-            volume_mm3=stored.total_volume_mm3,
+            total_boxes=stored.total_boxes,
+            total_units=stored.total_units,
+            products_amount_kopecks=stored.products_amount_kopecks,
+            total_weight_grams=stored.total_weight_grams,
+            cargo_places=stored.cargo_places,
+            total_volume_mm3=stored.total_volume_mm3,
             weight_kg=Decimal(stored.total_weight_grams) / _GRAMS_PER_KILOGRAM,
             volume_m3=Decimal(stored.total_volume_mm3) / _MM3_PER_M3,
         )

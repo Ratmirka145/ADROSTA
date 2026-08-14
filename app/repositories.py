@@ -16,11 +16,17 @@ from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from app.database import Database
+from app.domain import (
+    OrderCalculation,
+    PriceTier as DomainPriceTier,
+    Product as DomainProduct,
+)
 
 
 _SQLITE_MAX_INTEGER = 9_223_372_036_854_775_807
 _PRODUCT_UPDATE_FIELDS = {
     "name",
+    "units_per_box",
     "box_weight_grams",
     "box_volume_mm3",
     "box_length_mm",
@@ -73,9 +79,13 @@ class Product:
     box_length_mm: Optional[int] = None
     box_width_mm: Optional[int] = None
     box_height_mm: Optional[int] = None
+    units_per_box: int = 1
     active: bool = True
     created_at: Optional[int] = None
     updated_at: Optional[int] = None
+
+
+ProductPriceTier = DomainPriceTier
 
 
 @dataclass(frozen=True)
@@ -115,10 +125,16 @@ class OrderItemSnapshot:
     sku: str
     product_name: str
     boxes: int
+    units_per_box: int
+    units: int
+    price_per_unit_kopecks: int
+    price_per_box_kopecks: int
+    line_amount_kopecks: int
     unit_weight_grams: int
     unit_volume_mm3: int
     total_weight_grams: int
     total_volume_mm3: int
+    cargo_places: int
     box_length_mm: Optional[int] = None
     box_width_mm: Optional[int] = None
     box_height_mm: Optional[int] = None
@@ -128,10 +144,16 @@ class OrderItemSnapshot:
             "sku": self.sku,
             "name": self.product_name,
             "boxes": self.boxes,
+            "unitsPerBox": self.units_per_box,
+            "units": self.units,
+            "pricePerUnitKopecks": self.price_per_unit_kopecks,
+            "pricePerBoxKopecks": self.price_per_box_kopecks,
+            "lineAmountKopecks": self.line_amount_kopecks,
             "unitWeightGrams": self.unit_weight_grams,
             "unitVolumeMm3": self.unit_volume_mm3,
             "totalWeightGrams": self.total_weight_grams,
             "totalVolumeMm3": self.total_volume_mm3,
+            "cargoPlaces": self.cargo_places,
             "dimensionsMm": (
                 {
                     "length": self.box_length_mm,
@@ -150,8 +172,11 @@ class OrderResponse:
     status: str
     created_at: int
     total_boxes: int
+    total_units: int
+    products_amount_kopecks: int
     total_weight_grams: int
     total_volume_mm3: int
+    cargo_places: int
     items: Tuple[OrderItemSnapshot, ...]
 
     def as_dict(self) -> dict:
@@ -163,8 +188,11 @@ class OrderResponse:
             "createdAt": self.created_at,
             "totals": {
                 "boxes": self.total_boxes,
+                "totalUnits": self.total_units,
+                "productsAmountKopecks": self.products_amount_kopecks,
                 "weightGrams": self.total_weight_grams,
                 "volumeMm3": self.total_volume_mm3,
+                "cargoPlaces": self.cargo_places,
             },
             "items": [item.as_dict() for item in self.items],
         }
@@ -213,8 +241,11 @@ class WebhookOrder:
     recipient_email: Optional[str]
     comment: Optional[str]
     total_boxes: int
+    total_units: int
+    products_amount_kopecks: int
     total_weight_grams: int
     total_volume_mm3: int
+    cargo_places: int
     items: Tuple[OrderItemSnapshot, ...]
 
     def as_dict(self) -> dict:
@@ -279,8 +310,11 @@ class WebhookOrder:
             "comment": self.comment,
             "totals": {
                 "boxes": self.total_boxes,
+                "totalUnits": self.total_units,
+                "productsAmountKopecks": self.products_amount_kopecks,
                 "weightGrams": self.total_weight_grams,
                 "volumeMm3": self.total_volume_mm3,
+                "cargoPlaces": self.cargo_places,
             },
             "items": [item.as_dict() for item in self.items],
         }
@@ -339,13 +373,6 @@ def _positive_integer(value: int, field: str) -> int:
     return value
 
 
-def _checked_multiply(left: int, right: int, field: str) -> int:
-    result = left * right
-    if result > _SQLITE_MAX_INTEGER:
-        raise InvalidOrderError(f"Calculated {field} exceeds SQLite integer range")
-    return result
-
-
 class ProductRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -354,6 +381,7 @@ class ProductRepository:
     def _validate(product: Product) -> Product:
         sku = _required_text(product.sku, "sku")
         name = _required_text(product.name, "name")
+        units_per_box = _positive_integer(product.units_per_box, "units_per_box")
         weight = _positive_integer(product.box_weight_grams, "box_weight_grams")
         volume = _positive_integer(product.box_volume_mm3, "box_volume_mm3")
 
@@ -380,6 +408,7 @@ class ProductRepository:
             product,
             sku=sku,
             name=name,
+            units_per_box=units_per_box,
             box_weight_grams=weight,
             box_volume_mm3=volume,
         )
@@ -389,6 +418,7 @@ class ProductRepository:
         return Product(
             sku=row["sku"],
             name=row["name"],
+            units_per_box=row["units_per_box"],
             box_weight_grams=row["box_weight_grams"],
             box_volume_mm3=row["box_volume_mm3"],
             box_length_mm=row["box_length_mm"],
@@ -407,14 +437,15 @@ class ProductRepository:
                 connection.execute(
                     """
                     INSERT INTO products (
-                        sku, name, box_weight_grams, box_volume_mm3,
+                        sku, name, units_per_box, box_weight_grams, box_volume_mm3,
                         box_length_mm, box_width_mm, box_height_mm,
                         active, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         product.sku,
                         product.name,
+                        product.units_per_box,
                         product.box_weight_grams,
                         product.box_volume_mm3,
                         product.box_length_mm,
@@ -440,12 +471,13 @@ class ProductRepository:
             connection.execute(
                 """
                 INSERT INTO products (
-                    sku, name, box_weight_grams, box_volume_mm3,
+                    sku, name, units_per_box, box_weight_grams, box_volume_mm3,
                     box_length_mm, box_width_mm, box_height_mm,
                     active, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sku) DO UPDATE SET
                     name = excluded.name,
+                    units_per_box = excluded.units_per_box,
                     box_weight_grams = excluded.box_weight_grams,
                     box_volume_mm3 = excluded.box_volume_mm3,
                     box_length_mm = excluded.box_length_mm,
@@ -457,6 +489,7 @@ class ProductRepository:
                 (
                     product.sku,
                     product.name,
+                    product.units_per_box,
                     product.box_weight_grams,
                     product.box_volume_mm3,
                     product.box_length_mm,
@@ -546,13 +579,14 @@ class ProductRepository:
             cursor = connection.execute(
                 """
                 UPDATE products SET
-                    name = ?, box_weight_grams = ?, box_volume_mm3 = ?,
+                    name = ?, units_per_box = ?, box_weight_grams = ?, box_volume_mm3 = ?,
                     box_length_mm = ?, box_width_mm = ?, box_height_mm = ?,
                     active = ?, updated_at = ?
                 WHERE sku = ?
                 """,
                 (
                     candidate.name,
+                    candidate.units_per_box,
                     candidate.box_weight_grams,
                     candidate.box_volume_mm3,
                     candidate.box_length_mm,
@@ -579,6 +613,107 @@ class ProductRepository:
         with self.database.transaction() as connection:
             cursor = connection.execute("DELETE FROM products WHERE sku = ?", (sku,))
             return cursor.rowcount == 1
+
+    def replace_price_tiers(
+        self,
+        sku: str,
+        tiers: Sequence[ProductPriceTier],
+        *,
+        now: Optional[int] = None,
+    ) -> tuple[ProductPriceTier, ...]:
+        """Atomically replace persisted tiers without applying pricing rules."""
+
+        sku = _required_text(sku, "sku")
+        normalized = tuple(tiers)
+        if any(not isinstance(tier, DomainPriceTier) for tier in normalized):
+            raise ValueError("tiers must contain ProductPriceTier values")
+        timestamp = _now(now)
+        with self.database.transaction() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM products WHERE sku = ?", (sku,)
+            ).fetchone()
+            if exists is None:
+                raise ProductNotFoundError(sku)
+            connection.execute(
+                "DELETE FROM product_price_tiers WHERE product_sku = ?", (sku,)
+            )
+            connection.executemany(
+                """
+                INSERT INTO product_price_tiers (
+                    product_sku, min_boxes, max_boxes,
+                    price_per_unit_kopecks, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        sku,
+                        tier.min_boxes,
+                        tier.max_boxes,
+                        tier.price_per_unit_kopecks,
+                        timestamp,
+                        timestamp,
+                    )
+                    for tier in normalized
+                ),
+            )
+        return normalized
+
+    def fetch_catalog(self, skus: Iterable[str]) -> Dict[str, DomainProduct]:
+        """Load canonical products and all their SKU-specific price tiers."""
+
+        cleaned = list(dict.fromkeys(_required_text(sku, "sku") for sku in skus))
+        if not cleaned:
+            return {}
+
+        rows_by_sku: Dict[str, sqlite3.Row] = {}
+        tiers_by_sku: Dict[str, list[DomainPriceTier]] = {
+            sku: [] for sku in cleaned
+        }
+        with self.database.connection() as connection:
+            for offset in range(0, len(cleaned), 500):
+                chunk = cleaned[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                product_rows = connection.execute(
+                    f"SELECT * FROM products "
+                    f"WHERE active = 1 AND sku IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in product_rows:
+                    rows_by_sku[row["sku"]] = row
+                tier_rows = connection.execute(
+                    f"""
+                    SELECT product_sku, min_boxes, max_boxes,
+                           price_per_unit_kopecks
+                    FROM product_price_tiers
+                    WHERE product_sku IN ({placeholders})
+                    ORDER BY product_sku, min_boxes, max_boxes
+                    """,
+                    chunk,
+                ).fetchall()
+                for row in tier_rows:
+                    tiers_by_sku[row["product_sku"]].append(
+                        DomainPriceTier(
+                            min_boxes=row["min_boxes"],
+                            max_boxes=row["max_boxes"],
+                            price_per_unit_kopecks=row[
+                                "price_per_unit_kopecks"
+                            ],
+                        )
+                    )
+
+        return {
+            sku: DomainProduct(
+                sku=sku,
+                name=row["name"],
+                units_per_box=row["units_per_box"],
+                weight_grams=row["box_weight_grams"],
+                length_mm=row["box_length_mm"],
+                width_mm=row["box_width_mm"],
+                height_mm=row["box_height_mm"],
+                price_tiers=tuple(tiers_by_sku[sku]),
+            )
+            for sku, row in rows_by_sku.items()
+        }
 
 
 class RateLimitRepository:
@@ -676,7 +811,8 @@ class OrderRepository:
     def _validated_items(items: Sequence[OrderItemInput]) -> List[OrderItemInput]:
         if not items:
             raise InvalidOrderError("Order must contain at least one item")
-        aggregated: Dict[str, int] = {}
+        validated: List[OrderItemInput] = []
+        seen: set[str] = set()
         for item in items:
             if not isinstance(item, OrderItemInput):
                 raise InvalidOrderError("items must contain OrderItemInput values")
@@ -685,11 +821,11 @@ class OrderRepository:
                 boxes = _positive_integer(item.boxes, "item.boxes")
             except ValueError as exc:
                 raise InvalidOrderError(str(exc)) from exc
-            combined = aggregated.get(sku, 0) + boxes
-            if combined > _SQLITE_MAX_INTEGER:
-                raise InvalidOrderError("Combined box count exceeds SQLite integer range")
-            aggregated[sku] = combined
-        return [OrderItemInput(sku=sku, boxes=boxes) for sku, boxes in aggregated.items()]
+            if sku in seen:
+                raise InvalidOrderError("Order items must contain unique SKU values")
+            seen.add(sku)
+            validated.append(OrderItemInput(sku=sku, boxes=boxes))
+        return validated
 
     @staticmethod
     def _validate_draft(draft: OrderDraft) -> List[OrderItemInput]:
@@ -772,6 +908,11 @@ class OrderRepository:
                 sku=row["sku"],
                 product_name=row["product_name"],
                 boxes=row["boxes"],
+                units_per_box=row["units_per_box"],
+                units=row["units"],
+                price_per_unit_kopecks=row["price_per_unit_kopecks"],
+                price_per_box_kopecks=row["price_per_box_kopecks"],
+                line_amount_kopecks=row["line_amount_kopecks"],
                 unit_weight_grams=row["unit_weight_grams"],
                 unit_volume_mm3=row["unit_volume_mm3"],
                 box_length_mm=row["box_length_mm"],
@@ -779,6 +920,7 @@ class OrderRepository:
                 box_height_mm=row["box_height_mm"],
                 total_weight_grams=row["total_weight_grams"],
                 total_volume_mm3=row["total_volume_mm3"],
+                cargo_places=row["cargo_places"],
             )
             for row in rows
         )
@@ -789,8 +931,9 @@ class OrderRepository:
     ) -> Optional[OrderResponse]:
         row = connection.execute(
             """
-            SELECT id, status, created_at, total_boxes,
-                   total_weight_grams, total_volume_mm3
+            SELECT id, status, created_at, total_boxes, total_units,
+                   products_amount_kopecks, total_weight_grams,
+                   total_volume_mm3, cargo_places
             FROM orders WHERE id = ?
             """,
             (order_id,),
@@ -802,8 +945,11 @@ class OrderRepository:
             status=row["status"],
             created_at=row["created_at"],
             total_boxes=row["total_boxes"],
+            total_units=row["total_units"],
+            products_amount_kopecks=row["products_amount_kopecks"],
             total_weight_grams=row["total_weight_grams"],
             total_volume_mm3=row["total_volume_mm3"],
+            cargo_places=row["cargo_places"],
             items=cls._items_for_order(connection, order_id),
         )
 
@@ -852,6 +998,7 @@ class OrderRepository:
         self,
         draft: OrderDraft,
         *,
+        calculation: OrderCalculation,
         request_hash: str,
         duplicate_fingerprint: str,
         idempotency_key: Optional[str] = None,
@@ -860,6 +1007,34 @@ class OrderRepository:
         now: Optional[int] = None,
     ) -> CreateOrderResult:
         items = self._validate_draft(draft)
+        if not isinstance(calculation, OrderCalculation):
+            raise InvalidOrderError("calculation must be an OrderCalculation")
+        if [(item.sku, item.boxes) for item in items] != [
+            (item.sku, item.boxes) for item in calculation.items
+        ]:
+            raise InvalidOrderError("calculation does not match draft items")
+        snapshots = tuple(
+            OrderItemSnapshot(
+                sku=item.sku,
+                product_name=item.name,
+                boxes=item.boxes,
+                units_per_box=item.units_per_box,
+                units=item.units,
+                price_per_unit_kopecks=item.price_per_unit_kopecks,
+                price_per_box_kopecks=item.price_per_box_kopecks,
+                line_amount_kopecks=item.line_amount_kopecks,
+                unit_weight_grams=item.weight_per_box_grams,
+                unit_volume_mm3=item.box_volume_mm3,
+                box_length_mm=item.length_mm,
+                box_width_mm=item.width_mm,
+                box_height_mm=item.height_mm,
+                total_weight_grams=item.total_weight_grams,
+                total_volume_mm3=item.total_volume_mm3,
+                cargo_places=item.cargo_places,
+            )
+            for item in calculation.items
+        )
+        totals = calculation.totals
         try:
             request_hash = _required_text(request_hash, "request_hash")
             duplicate_fingerprint = _required_text(
@@ -933,64 +1108,6 @@ class OrderRepository:
                     duplicate=True,
                 )
 
-            skus = [item.sku for item in items]
-            placeholders = ",".join("?" for _ in skus)
-            product_rows = connection.execute(
-                f"SELECT * FROM products WHERE active = 1 AND sku IN ({placeholders})",
-                skus,
-            ).fetchall()
-            products = {row["sku"]: row for row in product_rows}
-            missing = [sku for sku in skus if sku not in products]
-            if missing:
-                raise UnknownProductError(missing)
-
-            snapshots: List[OrderItemSnapshot] = []
-            total_boxes = 0
-            total_weight = 0
-            total_volume = 0
-            for item in items:
-                product = products[item.sku]
-                dimensions = (
-                    product["box_length_mm"],
-                    product["box_width_mm"],
-                    product["box_height_mm"],
-                )
-                if not all(type(value) is int and value > 0 for value in dimensions):
-                    raise ProductCatalogError(
-                        "Trusted product dimensions are incomplete"
-                    )
-                if product["box_volume_mm3"] != (
-                    dimensions[0] * dimensions[1] * dimensions[2]
-                ):
-                    raise ProductCatalogError(
-                        "Trusted product volume does not match its dimensions"
-                    )
-                item_weight = _checked_multiply(
-                    product["box_weight_grams"], item.boxes, "item weight"
-                )
-                item_volume = _checked_multiply(
-                    product["box_volume_mm3"], item.boxes, "item volume"
-                )
-                total_boxes += item.boxes
-                total_weight += item_weight
-                total_volume += item_volume
-                if max(total_boxes, total_weight, total_volume) > _SQLITE_MAX_INTEGER:
-                    raise InvalidOrderError("Calculated order totals exceed SQLite range")
-                snapshots.append(
-                    OrderItemSnapshot(
-                        sku=item.sku,
-                        product_name=product["name"],
-                        boxes=item.boxes,
-                        unit_weight_grams=product["box_weight_grams"],
-                        unit_volume_mm3=product["box_volume_mm3"],
-                        box_length_mm=product["box_length_mm"],
-                        box_width_mm=product["box_width_mm"],
-                        box_height_mm=product["box_height_mm"],
-                        total_weight_grams=item_weight,
-                        total_volume_mm3=item_volume,
-                    )
-                )
-
             order_id = str(uuid.uuid4())
             connection.execute(
                 """
@@ -1001,12 +1118,13 @@ class OrderRepository:
                     delivery_region, delivery_city, delivery_office_code,
                     delivery_postcode, delivery_street, delivery_house,
                     delivery_apartment, recipient_contact_name, recipient_phone,
-                    recipient_email, comment, total_boxes,
-                    total_weight_grams, total_volume_mm3,
+                    recipient_email, comment, total_boxes, total_units,
+                    products_amount_kopecks, total_weight_grams,
+                    total_volume_mm3, cargo_places,
                     request_fingerprint_digest, created_at, updated_at
                 ) VALUES (
                     ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1032,9 +1150,12 @@ class OrderRepository:
                     draft.recipient_phone,
                     draft.recipient_email,
                     draft.comment,
-                    total_boxes,
-                    total_weight,
-                    total_volume,
+                    totals.total_boxes,
+                    totals.total_units,
+                    totals.products_amount_kopecks,
+                    totals.total_weight_grams,
+                    totals.total_volume_mm3,
+                    totals.cargo_places,
                     fingerprint_digest,
                     timestamp,
                     timestamp,
@@ -1046,10 +1167,12 @@ class OrderRepository:
                     """
                     INSERT INTO order_items (
                         order_id, line_number, sku, product_name, boxes,
+                        units_per_box, units, price_per_unit_kopecks,
+                        price_per_box_kopecks, line_amount_kopecks,
                         unit_weight_grams, unit_volume_mm3,
                         box_length_mm, box_width_mm, box_height_mm,
-                        total_weight_grams, total_volume_mm3
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        total_weight_grams, total_volume_mm3, cargo_places
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         order_id,
@@ -1057,6 +1180,11 @@ class OrderRepository:
                         snapshot.sku,
                         snapshot.product_name,
                         snapshot.boxes,
+                        snapshot.units_per_box,
+                        snapshot.units,
+                        snapshot.price_per_unit_kopecks,
+                        snapshot.price_per_box_kopecks,
+                        snapshot.line_amount_kopecks,
                         snapshot.unit_weight_grams,
                         snapshot.unit_volume_mm3,
                         snapshot.box_length_mm,
@@ -1064,6 +1192,7 @@ class OrderRepository:
                         snapshot.box_height_mm,
                         snapshot.total_weight_grams,
                         snapshot.total_volume_mm3,
+                        snapshot.cargo_places,
                     ),
                 )
 
@@ -1097,10 +1226,13 @@ class OrderRepository:
                 order_id=order_id,
                 status="accepted",
                 created_at=timestamp,
-                total_boxes=total_boxes,
-                total_weight_grams=total_weight,
-                total_volume_mm3=total_volume,
-                items=tuple(snapshots),
+                total_boxes=totals.total_boxes,
+                total_units=totals.total_units,
+                products_amount_kopecks=totals.products_amount_kopecks,
+                total_weight_grams=totals.total_weight_grams,
+                total_volume_mm3=totals.total_volume_mm3,
+                cargo_places=totals.cargo_places,
+                items=snapshots,
             )
             return CreateOrderResult(
                 response=response,
@@ -1148,8 +1280,11 @@ class OrderRepository:
                 recipient_email=row["recipient_email"],
                 comment=row["comment"],
                 total_boxes=row["total_boxes"],
+                total_units=row["total_units"],
+                products_amount_kopecks=row["products_amount_kopecks"],
                 total_weight_grams=row["total_weight_grams"],
                 total_volume_mm3=row["total_volume_mm3"],
+                cargo_places=row["cargo_places"],
                 items=self._items_for_order(connection, order_id),
             )
 

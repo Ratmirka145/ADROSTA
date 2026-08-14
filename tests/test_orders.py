@@ -56,7 +56,7 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
     assert body["totals"]["volumeMm3"] == 480_000_000
     assert Decimal(str(body["totals"]["weightKg"])) == Decimal("50")
     assert Decimal(str(body["totals"]["volumeM3"])) == Decimal("0.48")
-    assert body["items"][0] == {
+    assert {
         "sku": "ADR-001",
         "boxes": 2,
         "boxWeightGrams": 12_500,
@@ -68,7 +68,17 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
         "volumeMm3": 240_000_000,
         "weightKg": "25",
         "volumeM3": "0.24",
-    }
+    }.items() <= body["items"][0].items()
+    assert body["items"][0]["name"] == "ADROSTA test product 1"
+    assert body["items"][0]["unitsPerBox"] == 10
+    assert body["items"][0]["units"] == 20
+    assert body["items"][0]["pricePerUnitKopecks"] == 10_000
+    assert body["items"][0]["pricePerBoxKopecks"] == 100_000
+    assert body["items"][0]["lineAmountKopecks"] == 200_000
+    assert body["totals"]["totalBoxes"] == 3
+    assert body["totals"]["totalUnits"] == 40
+    assert body["totals"]["productsAmountKopecks"] == 600_000
+    assert body["totals"]["cargoPlaces"] == 3
 
     with app.state.context.database.connection() as connection:
         stored = connection.execute(

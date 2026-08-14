@@ -1,8 +1,7 @@
-"""Trusted product data and order cargo calculations.
+"""Canonical catalog models and the single trusted order calculator.
 
-All product measurements are per box.  Calculations stay in integer grams and
-cubic millimetres; Decimal kg/m3 values are exact derived representations for
-the API response.
+All physical measurements describe one box. Money is represented only as
+integer kopecks; weights and volumes use integer grams and cubic millimetres.
 """
 
 from __future__ import annotations
@@ -38,37 +37,81 @@ class UnknownSkuError(DomainError):
         super().__init__(f"unknown SKU: {', '.join(self.skus)}")
 
 
+class PriceTierNotFoundError(DomainError):
+    def __init__(self, sku: str, boxes: int) -> None:
+        self.sku = sku
+        self.boxes = boxes
+        super().__init__(f"no price tier for SKU {sku} and {boxes} boxes")
+
+
+class AmbiguousPriceTierError(DomainError):
+    def __init__(self, sku: str, boxes: int) -> None:
+        self.sku = sku
+        self.boxes = boxes
+        super().__init__(f"multiple price tiers for SKU {sku} and {boxes} boxes")
+
+
 class CatalogIntegrityError(RuntimeError):
     """Trusted product data is absent or internally inconsistent."""
 
 
 def _require_non_empty_string(name: str, value: object) -> None:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{name} must be a non-empty string")
+        raise CatalogIntegrityError(f"{name} must be a non-empty string")
 
 
 def _require_positive_integer(name: str, value: object) -> None:
-    # bool is an int subclass, but is never a valid measurement or quantity.
     if type(value) is not int or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
+        raise CatalogIntegrityError(f"{name} must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class PriceTier:
+    min_boxes: int
+    max_boxes: int | None
+    price_per_unit_kopecks: int
+
+    def __post_init__(self) -> None:
+        _require_positive_integer("min_boxes", self.min_boxes)
+        if self.max_boxes is not None:
+            _require_positive_integer("max_boxes", self.max_boxes)
+            if self.max_boxes < self.min_boxes:
+                raise CatalogIntegrityError("max_boxes must be at least min_boxes")
+        _require_positive_integer(
+            "price_per_unit_kopecks", self.price_per_unit_kopecks
+        )
+
+    def matches(self, boxes: int) -> bool:
+        return boxes >= self.min_boxes and (
+            self.max_boxes is None or boxes <= self.max_boxes
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class Product:
-    """Authoritative per-box product characteristics."""
+    """Authoritative product characteristics and SKU-specific price tiers."""
 
     sku: str
+    name: str
+    units_per_box: int
     weight_grams: int
     length_mm: int
     width_mm: int
     height_mm: int
+    price_tiers: tuple[PriceTier, ...]
 
     def __post_init__(self) -> None:
         _require_non_empty_string("sku", self.sku)
+        _require_non_empty_string("name", self.name)
+        _require_positive_integer("units_per_box", self.units_per_box)
         _require_positive_integer("weight_grams", self.weight_grams)
         _require_positive_integer("length_mm", self.length_mm)
         _require_positive_integer("width_mm", self.width_mm)
         _require_positive_integer("height_mm", self.height_mm)
+        if not isinstance(self.price_tiers, tuple):
+            raise CatalogIntegrityError("price_tiers must be a tuple")
+        if any(not isinstance(tier, PriceTier) for tier in self.price_tiers):
+            raise CatalogIntegrityError("price_tiers must contain PriceTier values")
 
     @property
     def volume_mm3(self) -> int:
@@ -76,8 +119,6 @@ class Product:
 
 
 class SupportsOrderItem(Protocol):
-    """Structural input accepted by :func:`calculate_order`."""
-
     @property
     def sku(self) -> str: ...
 
@@ -86,45 +127,53 @@ class SupportsOrderItem(Protocol):
 
 
 class ProductCatalog(Protocol):
-    """Interface implemented by a SQLite or trusted Python catalog."""
-
     def get_products(self, skus: Sequence[str]) -> Mapping[str, Product]: ...
 
 
 @dataclass(frozen=True, slots=True)
 class CalculatedOrderItem:
     sku: str
+    name: str
     boxes: int
-    box_weight_grams: int
-    box_volume_mm3: int
+    units_per_box: int
+    units: int
+    price_per_unit_kopecks: int
+    price_per_box_kopecks: int
+    line_amount_kopecks: int
+    weight_per_box_grams: int
+    total_weight_grams: int
     length_mm: int
     width_mm: int
     height_mm: int
-    weight_grams: int
-    volume_mm3: int
+    cargo_places: int
+    box_volume_mm3: int
+    total_volume_mm3: int
 
     @property
     def weight_kg(self) -> Decimal:
-        return Decimal(self.weight_grams) / GRAMS_PER_KILOGRAM
+        return Decimal(self.total_weight_grams) / GRAMS_PER_KILOGRAM
 
     @property
     def volume_m3(self) -> Decimal:
-        return Decimal(self.volume_mm3) / CUBIC_MILLIMETRES_PER_CUBIC_METRE
+        return Decimal(self.total_volume_mm3) / CUBIC_MILLIMETRES_PER_CUBIC_METRE
 
 
 @dataclass(frozen=True, slots=True)
 class OrderTotals:
-    boxes: int
-    weight_grams: int
-    volume_mm3: int
+    total_boxes: int
+    total_units: int
+    products_amount_kopecks: int
+    total_weight_grams: int
+    cargo_places: int
+    total_volume_mm3: int
 
     @property
     def weight_kg(self) -> Decimal:
-        return Decimal(self.weight_grams) / GRAMS_PER_KILOGRAM
+        return Decimal(self.total_weight_grams) / GRAMS_PER_KILOGRAM
 
     @property
     def volume_m3(self) -> Decimal:
-        return Decimal(self.volume_mm3) / CUBIC_MILLIMETRES_PER_CUBIC_METRE
+        return Decimal(self.total_volume_mm3) / CUBIC_MILLIMETRES_PER_CUBIC_METRE
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,16 +182,20 @@ class OrderCalculation:
     totals: OrderTotals
 
 
+def _price_for(product: Product, boxes: int) -> int:
+    matches = tuple(tier for tier in product.price_tiers if tier.matches(boxes))
+    if not matches:
+        raise PriceTierNotFoundError(product.sku, boxes)
+    if len(matches) > 1:
+        raise AmbiguousPriceTierError(product.sku, boxes)
+    return matches[0].price_per_unit_kopecks
+
+
 def calculate_order(
     items: Iterable[SupportsOrderItem],
     products_by_sku: Mapping[str, Product],
 ) -> OrderCalculation:
-    """Calculate trusted order metrics from requested boxes and catalog data.
-
-    ``items`` may contain Pydantic ``OrderItem`` values directly.  SKU lookup
-    is exact and case-sensitive.  The function never accepts client-provided
-    measurements.
-    """
+    """Calculate every commercial and cargo value from canonical server data."""
 
     requested_items = tuple(items)
     if not requested_items:
@@ -154,7 +207,6 @@ def calculate_order(
 
     seen_skus: set[str] = set()
     unknown_skus: list[str] = []
-
     for item in requested_items:
         if not isinstance(item.sku, str) or not item.sku.strip():
             raise InvalidOrderItemError("item SKU must be a non-empty string")
@@ -181,30 +233,49 @@ def calculate_order(
                 f"catalog key {item.sku} does not match product SKU {product.sku}"
             )
 
-        box_volume_mm3 = product.volume_mm3
+        price_per_unit = _price_for(product, item.boxes)
+        units = item.boxes * product.units_per_box
+        box_volume = product.volume_mm3
         calculated_items.append(
             CalculatedOrderItem(
                 sku=item.sku,
+                name=product.name,
                 boxes=item.boxes,
-                box_weight_grams=product.weight_grams,
-                box_volume_mm3=box_volume_mm3,
+                units_per_box=product.units_per_box,
+                units=units,
+                price_per_unit_kopecks=price_per_unit,
+                price_per_box_kopecks=price_per_unit * product.units_per_box,
+                line_amount_kopecks=units * price_per_unit,
+                weight_per_box_grams=product.weight_grams,
+                total_weight_grams=product.weight_grams * item.boxes,
                 length_mm=product.length_mm,
                 width_mm=product.width_mm,
                 height_mm=product.height_mm,
-                weight_grams=product.weight_grams * item.boxes,
-                volume_mm3=box_volume_mm3 * item.boxes,
+                cargo_places=item.boxes,
+                box_volume_mm3=box_volume,
+                total_volume_mm3=box_volume * item.boxes,
             )
         )
 
     totals = OrderTotals(
-        boxes=sum(item.boxes for item in calculated_items),
-        weight_grams=sum(item.weight_grams for item in calculated_items),
-        volume_mm3=sum(item.volume_mm3 for item in calculated_items),
+        total_boxes=sum(item.boxes for item in calculated_items),
+        total_units=sum(item.units for item in calculated_items),
+        products_amount_kopecks=sum(
+            item.line_amount_kopecks for item in calculated_items
+        ),
+        total_weight_grams=sum(
+            item.total_weight_grams for item in calculated_items
+        ),
+        cargo_places=sum(item.cargo_places for item in calculated_items),
+        total_volume_mm3=sum(
+            item.total_volume_mm3 for item in calculated_items
+        ),
     )
     return OrderCalculation(items=tuple(calculated_items), totals=totals)
 
 
 __all__ = [
+    "AmbiguousPriceTierError",
     "CUBIC_MILLIMETRES_PER_CUBIC_METRE",
     "CalculatedOrderItem",
     "CatalogIntegrityError",
@@ -216,6 +287,8 @@ __all__ = [
     "MAX_ITEMS_PER_ORDER",
     "OrderCalculation",
     "OrderTotals",
+    "PriceTier",
+    "PriceTierNotFoundError",
     "Product",
     "ProductCatalog",
     "SupportsOrderItem",

@@ -21,6 +21,7 @@ from pydantic import (
     Field,
     StrictInt,
     StringConstraints,
+    computed_field,
     field_validator,
     model_validator,
 )
@@ -266,6 +267,20 @@ class OrderItem(ApiModel):
     boxes: Annotated[StrictInt, Field(ge=1, le=10_000)]
 
 
+class CartCalculateRequest(ApiModel):
+    items: Annotated[list[OrderItem], Field(min_length=1, max_length=100)]
+
+    @model_validator(mode="after")
+    def reject_duplicate_skus(self) -> CartCalculateRequest:
+        skus = [item.sku for item in self.items]
+        if len(skus) != len(set(skus)):
+            raise PydanticCustomError(
+                "duplicate_sku",
+                "items must not contain duplicate SKU values",
+            )
+        return self
+
+
 class OrderCreateRequest(ApiModel):
     buyer: Buyer
     company: Company | None = None
@@ -306,24 +321,64 @@ OrderCreate = OrderCreateRequest
 
 class CalculatedItemResponse(ApiModel):
     sku: str
+    name: str
     boxes: int
-    box_weight_grams: int
+    units_per_box: int
+    units: int
+    price_per_unit_kopecks: int
+    price_per_box_kopecks: int
+    line_amount_kopecks: int
+    weight_per_box_grams: int
+    total_weight_grams: int
     box_volume_mm3: int
     length_mm: int
     width_mm: int
     height_mm: int
-    weight_grams: int
-    volume_mm3: int
+    cargo_places: int
+    total_volume_mm3: int
     weight_kg: Decimal
     volume_m3: Decimal
+
+    @computed_field(alias="boxWeightGrams")
+    @property
+    def legacy_box_weight_grams(self) -> int:
+        return self.weight_per_box_grams
+
+    @computed_field(alias="weightGrams")
+    @property
+    def legacy_weight_grams(self) -> int:
+        return self.total_weight_grams
+
+    @computed_field(alias="volumeMm3")
+    @property
+    def legacy_volume_mm3(self) -> int:
+        return self.total_volume_mm3
 
 
 class OrderTotalsResponse(ApiModel):
-    boxes: int
-    weight_grams: int
-    volume_mm3: int
+    total_boxes: int
+    total_units: int
+    products_amount_kopecks: int
+    total_weight_grams: int
+    cargo_places: int
+    total_volume_mm3: int
     weight_kg: Decimal
     volume_m3: Decimal
+
+    @computed_field(alias="boxes")
+    @property
+    def legacy_boxes(self) -> int:
+        return self.total_boxes
+
+    @computed_field(alias="weightGrams")
+    @property
+    def legacy_weight_grams(self) -> int:
+        return self.total_weight_grams
+
+    @computed_field(alias="volumeMm3")
+    @property
+    def legacy_volume_mm3(self) -> int:
+        return self.total_volume_mm3
 
 
 class OrderCalculationResponse(ApiModel):
@@ -367,6 +422,7 @@ __all__ = [
     "Buyer",
     "BuyerType",
     "CdekDeliveryType",
+    "CartCalculateRequest",
     "CalculatedItemResponse",
     "Company",
     "Delivery",
