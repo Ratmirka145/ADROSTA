@@ -96,13 +96,14 @@ class OrderDraft:
     company_inn: Optional[str] = None
     company_kpp: Optional[str] = None
     company_legal_address: Optional[str] = None
-    delivery_company: Optional[str] = None
+    delivery_type: Optional[str] = None
     delivery_region: Optional[str] = None
     delivery_city: Optional[str] = None
-    delivery_pickup_point: Optional[str] = None
-    delivery_address: Optional[str] = None
-    delivery_unloading_required: Optional[bool] = None
-    delivery_access_restrictions: Optional[str] = None
+    delivery_office_code: Optional[str] = None
+    delivery_postcode: Optional[str] = None
+    delivery_street: Optional[str] = None
+    delivery_house: Optional[str] = None
+    delivery_apartment: Optional[str] = None
     recipient_contact_name: Optional[str] = None
     recipient_phone: Optional[str] = None
     recipient_email: Optional[str] = None
@@ -199,13 +200,14 @@ class WebhookOrder:
     company_kpp: Optional[str]
     company_legal_address: Optional[str]
     delivery_method: str
-    delivery_company: Optional[str]
+    delivery_type: Optional[str]
     delivery_region: Optional[str]
     delivery_city: Optional[str]
-    delivery_pickup_point: Optional[str]
-    delivery_address: Optional[str]
-    delivery_unloading_required: Optional[bool]
-    delivery_access_restrictions: Optional[str]
+    delivery_office_code: Optional[str]
+    delivery_postcode: Optional[str]
+    delivery_street: Optional[str]
+    delivery_house: Optional[str]
+    delivery_apartment: Optional[str]
     recipient_contact_name: Optional[str]
     recipient_phone: Optional[str]
     recipient_email: Optional[str]
@@ -235,6 +237,33 @@ class WebhookOrder:
                 "legalAddress": self.company_legal_address,
             }
 
+        delivery = {"method": self.delivery_method}
+        for name, value in (
+            ("type", self.delivery_type),
+            ("region", self.delivery_region),
+            ("city", self.delivery_city),
+            ("officeCode", self.delivery_office_code),
+            ("postcode", self.delivery_postcode),
+            ("street", self.delivery_street),
+            ("house", self.delivery_house),
+            ("apartment", self.delivery_apartment),
+        ):
+            if value is not None:
+                delivery[name] = value
+        if any(
+            value is not None
+            for value in (
+                self.recipient_contact_name,
+                self.recipient_phone,
+                self.recipient_email,
+            )
+        ):
+            delivery["recipient"] = {
+                "contactName": self.recipient_contact_name,
+                "phone": self.recipient_phone,
+                "email": self.recipient_email,
+            }
+
         return {
             "orderId": self.order_id,
             "status": self.status,
@@ -246,21 +275,7 @@ class WebhookOrder:
                 "email": self.buyer_email,
             },
             "company": company,
-            "delivery": {
-                "method": self.delivery_method,
-                "transportCompany": self.delivery_company,
-                "region": self.delivery_region,
-                "city": self.delivery_city,
-                "pickupPoint": self.delivery_pickup_point,
-                "address": self.delivery_address,
-                "unloadingRequired": self.delivery_unloading_required,
-                "accessRestrictions": self.delivery_access_restrictions,
-                "recipient": {
-                    "contactName": self.recipient_contact_name,
-                    "phone": self.recipient_phone,
-                    "email": self.recipient_email,
-                },
-            },
+            "delivery": delivery,
             "comment": self.comment,
             "totals": {
                 "boxes": self.total_boxes,
@@ -691,10 +706,54 @@ class OrderRepository:
                 _required_text(getattr(draft, field), field)
             except ValueError as exc:
                 raise InvalidOrderError(str(exc)) from exc
-        if draft.delivery_unloading_required is not None and not isinstance(
-            draft.delivery_unloading_required, bool
-        ):
-            raise InvalidOrderError("delivery_unloading_required must be boolean or null")
+        method = draft.delivery_method.strip()
+        if method not in {"self_pickup", "cdek"}:
+            raise InvalidOrderError("delivery_method must be self_pickup or cdek")
+        if method == "self_pickup":
+            if any(
+                value is not None
+                for value in (
+                    draft.delivery_type,
+                    draft.delivery_region,
+                    draft.delivery_city,
+                    draft.delivery_office_code,
+                    draft.delivery_postcode,
+                    draft.delivery_street,
+                    draft.delivery_house,
+                    draft.delivery_apartment,
+                )
+            ):
+                raise InvalidOrderError("self_pickup must not contain CDEK fields")
+        else:
+            if draft.delivery_type not in {"pickup", "door"}:
+                raise InvalidOrderError("CDEK delivery_type must be pickup or door")
+            try:
+                _required_text(draft.delivery_city, "delivery_city")
+            except ValueError as exc:
+                raise InvalidOrderError(str(exc)) from exc
+            if draft.delivery_type == "pickup":
+                if any(
+                    value is not None
+                    for value in (
+                        draft.delivery_postcode,
+                        draft.delivery_street,
+                        draft.delivery_house,
+                        draft.delivery_apartment,
+                    )
+                ):
+                    raise InvalidOrderError(
+                        "CDEK pickup must not contain door address fields"
+                    )
+            else:
+                for field in ("delivery_street", "delivery_house"):
+                    try:
+                        _required_text(getattr(draft, field), field)
+                    except ValueError as exc:
+                        raise InvalidOrderError(str(exc)) from exc
+                if draft.delivery_office_code is not None:
+                    raise InvalidOrderError(
+                        "CDEK door delivery must not contain delivery_office_code"
+                    )
         return OrderRepository._validated_items(draft.items)
 
     @staticmethod
@@ -938,16 +997,16 @@ class OrderRepository:
                 INSERT INTO orders (
                     id, status, buyer_type, buyer_contact_name, buyer_phone,
                     buyer_email, company_name, company_inn, company_kpp,
-                    company_legal_address, delivery_method, delivery_company,
-                    delivery_region, delivery_city, delivery_pickup_point,
-                    delivery_address, delivery_unloading_required,
-                    delivery_access_restrictions, recipient_contact_name,
-                    recipient_phone, recipient_email, comment, total_boxes,
+                    company_legal_address, delivery_method, delivery_type,
+                    delivery_region, delivery_city, delivery_office_code,
+                    delivery_postcode, delivery_street, delivery_house,
+                    delivery_apartment, recipient_contact_name, recipient_phone,
+                    recipient_email, comment, total_boxes,
                     total_weight_grams, total_volume_mm3,
                     request_fingerprint_digest, created_at, updated_at
                 ) VALUES (
                     ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -961,17 +1020,14 @@ class OrderRepository:
                     draft.company_kpp,
                     draft.company_legal_address,
                     draft.delivery_method.strip(),
-                    draft.delivery_company,
+                    draft.delivery_type,
                     draft.delivery_region,
                     draft.delivery_city,
-                    draft.delivery_pickup_point,
-                    draft.delivery_address,
-                    (
-                        int(draft.delivery_unloading_required)
-                        if draft.delivery_unloading_required is not None
-                        else None
-                    ),
-                    draft.delivery_access_restrictions,
+                    draft.delivery_office_code,
+                    draft.delivery_postcode,
+                    draft.delivery_street,
+                    draft.delivery_house,
+                    draft.delivery_apartment,
                     draft.recipient_contact_name,
                     draft.recipient_phone,
                     draft.recipient_email,
@@ -1079,17 +1135,14 @@ class OrderRepository:
                 company_kpp=row["company_kpp"],
                 company_legal_address=row["company_legal_address"],
                 delivery_method=row["delivery_method"],
-                delivery_company=row["delivery_company"],
+                delivery_type=row["delivery_type"],
                 delivery_region=row["delivery_region"],
                 delivery_city=row["delivery_city"],
-                delivery_pickup_point=row["delivery_pickup_point"],
-                delivery_address=row["delivery_address"],
-                delivery_unloading_required=(
-                    bool(row["delivery_unloading_required"])
-                    if row["delivery_unloading_required"] is not None
-                    else None
-                ),
-                delivery_access_restrictions=row["delivery_access_restrictions"],
+                delivery_office_code=row["delivery_office_code"],
+                delivery_postcode=row["delivery_postcode"],
+                delivery_street=row["delivery_street"],
+                delivery_house=row["delivery_house"],
+                delivery_apartment=row["delivery_apartment"],
                 recipient_contact_name=row["recipient_contact_name"],
                 recipient_phone=row["recipient_phone"],
                 recipient_email=row["recipient_email"],

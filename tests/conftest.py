@@ -118,18 +118,7 @@ def order_payload_factory() -> Callable[..., dict[str, object]]:
                 "email": "buyer@EXAMPLE.COM",
             },
             "delivery": {
-                "method": "transport_company",
-                "transportCompany": "Тестовая транспортная компания",
-                "region": "Московская область",
-                "city": "Москва",
-                "pickupPoint": "Тестовый пункт выдачи",
-                "unloadingRequired": True,
-                "accessRestrictions": "Въезд по пропуску",
-                "recipient": {
-                    "contactName": "Пётр Иванов",
-                    "phone": "+7 999 765-43-21",
-                    "email": "recipient@EXAMPLE.COM",
-                },
+                "method": "self_pickup",
             },
             "comment": "Тестовый заказ",
             "items": [

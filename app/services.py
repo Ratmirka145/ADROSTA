@@ -259,17 +259,22 @@ class OrderService:
             company_inn=company.inn if company else None,
             company_kpp=company.kpp if company else None,
             company_legal_address=company.legal_address if company else None,
-            delivery_method=order.delivery.method,
-            delivery_company=order.delivery.transport_company,
+            delivery_method=order.delivery.method.value,
+            delivery_type=(
+                order.delivery.type.value if order.delivery.type is not None else None
+            ),
             delivery_region=order.delivery.region,
             delivery_city=order.delivery.city,
-            delivery_pickup_point=order.delivery.pickup_point,
-            delivery_address=order.delivery.address,
-            delivery_unloading_required=order.delivery.unloading_required,
-            delivery_access_restrictions=order.delivery.access_restrictions,
-            recipient_contact_name=recipient.contact_name,
-            recipient_phone=recipient.phone,
-            recipient_email=str(recipient.email) if recipient.email else None,
+            delivery_office_code=order.delivery.office_code,
+            delivery_postcode=order.delivery.postcode,
+            delivery_street=order.delivery.street,
+            delivery_house=order.delivery.house,
+            delivery_apartment=order.delivery.apartment,
+            recipient_contact_name=(recipient.contact_name if recipient else None),
+            recipient_phone=(recipient.phone if recipient else None),
+            recipient_email=(
+                str(recipient.email) if recipient and recipient.email else None
+            ),
             comment=order.comment,
             items=tuple(
                 OrderItemInput(sku=item.sku, boxes=item.boxes) for item in order.items

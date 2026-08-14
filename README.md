@@ -73,7 +73,7 @@ flowchart LR
 - строгая проверка структуры и типов, неизвестные поля запрещены;
 - нормализация российского телефона `8XXXXXXXXXX` или `7XXXXXXXXXX` в `+7XXXXXXXXXX` и проверка email;
 - реквизиты компании обязательны для `buyer.type = business` и запрещены для `individual`;
-- ровно один пункт назначения: `pickupPoint` или `address`;
+- строгий выбор получения заказа: самовывоз либо СДЭК до ПВЗ/двери;
 - приём от клиента только `sku` и `boxes` для каждой позиции;
 - точный, регистрозависимый поиск активного SKU в SQLite;
 - серверный пересчёт веса, объёма и габаритов из доверенного каталога;
@@ -188,19 +188,63 @@ python -m app.cli product activate --sku "SKU-001"
 | `company.inn` | 10 цифр для организации или 12 цифр для ИП |
 | `company.kpp` | Ровно 9 цифр и обязательно для 10-значного ИНН; отсутствует для ИП с 12-значным ИНН |
 | `company.legalAddress` | 1–500 символов |
-| `delivery.method` | Обязательно, 1–100 символов |
-| `delivery.transportCompany` | Необязательно, до 200 символов |
-| `delivery.region`, `delivery.city` | Обязательны, до 200 символов каждое |
-| `delivery.pickupPoint` / `delivery.address` | Должно быть заполнено ровно одно из двух |
-| `delivery.unloadingRequired` | Строго `true` или `false` |
-| `delivery.accessRestrictions` | Необязательно, до 1000 символов |
-| `delivery.recipient.contactName` | Обязательно, до 200 символов |
+| `delivery.method` | Строго `self_pickup` или `cdek` |
+| `delivery.type` | Для СДЭК обязательно: `pickup` или `door`; для самовывоза отсутствует |
+| `delivery.region` | Необязательно для СДЭК, до 200 символов |
+| `delivery.city` | Обязательно для СДЭК, до 200 символов |
+| `delivery.officeCode` | Необязательный код ПВЗ для `cdek/pickup`; для `door` запрещён |
+| `delivery.street`, `delivery.house` | Обязательны только для `cdek/door` |
+| `delivery.postcode`, `delivery.apartment` | Необязательны только для `cdek/door` |
+| `delivery.recipient.contactName` | Необязательно; если передан `recipient`, имя обязательно, до 200 символов |
 | `delivery.recipient.phone` | Те же правила телефона |
 | `delivery.recipient.email` | Необязательный корректный email |
 | `comment` | Необязательно, до 2000 символов |
 | `items` | 1–100 уникальных позиций |
 | `items[].sku` | Обязательный активный SKU, максимум 64 символа |
 | `items[].boxes` | Целое число от 1 до 10000 |
+
+Валидный самовывоз не требует параметров СДЭК:
+
+```json
+{
+  "delivery": {
+    "method": "self_pickup"
+  }
+}
+```
+
+Доставка СДЭК до ПВЗ:
+
+```json
+{
+  "delivery": {
+    "method": "cdek",
+    "type": "pickup",
+    "region": "Москва",
+    "city": "Москва",
+    "officeCode": null
+  }
+}
+```
+
+Доставка СДЭК до двери использует структурированный адрес:
+
+```json
+{
+  "delivery": {
+    "method": "cdek",
+    "type": "door",
+    "region": "Москва",
+    "city": "Москва",
+    "postcode": "115054",
+    "street": "Дубининская",
+    "house": "53",
+    "apartment": "12"
+  }
+}
+```
+
+На текущем этапе backend только принимает и сохраняет выбранный способ получения. Расчёт тарифа СДЭК и получение списка ПВЗ будут подключены отдельно; обращения к API СДЭК сейчас не выполняются.
 
 Для позиции заказа API принимает только `sku` и `boxes`. Поля цены, веса, объёма, размеров и клиентские totals будут отклонены как неизвестные. Общий предел коробок дополнительно задаёт `MAX_TOTAL_BOXES`.
 

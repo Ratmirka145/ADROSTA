@@ -73,8 +73,7 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
     with app.state.context.database.connection() as connection:
         stored = connection.execute(
             """
-            SELECT buyer_type, buyer_phone, buyer_email,
-                   recipient_phone, recipient_email
+            SELECT buyer_type, buyer_phone, buyer_email
             FROM orders WHERE id = ?
             """,
             (body["orderId"],),
@@ -83,8 +82,304 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
     assert stored["buyer_type"] == "individual"
     assert stored["buyer_phone"] == "+79991234567"
     assert stored["buyer_email"] == "buyer@example.com"
-    assert stored["recipient_phone"] == "+79997654321"
-    assert stored["recipient_email"] == "recipient@example.com"
+
+
+def test_creates_self_pickup_order_and_persists_only_delivery_method(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {"method": "self_pickup"}
+
+    response = _post_order(client, payload, key="self-pickup-order-key-0001")
+
+    assert response.status_code == 201
+    with app.state.context.database.connection() as connection:
+        stored = connection.execute(
+            """
+            SELECT delivery_method, delivery_type, delivery_region, delivery_city,
+                   delivery_office_code, delivery_postcode, delivery_street,
+                   delivery_house, delivery_apartment
+            FROM orders WHERE id = ?
+            """,
+            (response.json()["orderId"],),
+        ).fetchone()
+    assert stored is not None
+    assert dict(stored) == {
+        "delivery_method": "self_pickup",
+        "delivery_type": None,
+        "delivery_region": None,
+        "delivery_city": None,
+        "delivery_office_code": None,
+        "delivery_postcode": None,
+        "delivery_street": None,
+        "delivery_house": None,
+        "delivery_apartment": None,
+    }
+
+
+def test_creates_cdek_pickup_order_and_persists_delivery_fields(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {
+        "method": "cdek",
+        "type": "pickup",
+        "region": "Москва",
+        "city": "Москва",
+        "officeCode": None,
+    }
+
+    response = _post_order(client, payload, key="cdek-pickup-order-key-0001")
+
+    assert response.status_code == 201
+    with app.state.context.database.connection() as connection:
+        stored = connection.execute(
+            """
+            SELECT delivery_method, delivery_type, delivery_region, delivery_city,
+                   delivery_office_code
+            FROM orders WHERE id = ?
+            """,
+            (response.json()["orderId"],),
+        ).fetchone()
+    assert stored is not None
+    assert dict(stored) == {
+        "delivery_method": "cdek",
+        "delivery_type": "pickup",
+        "delivery_region": "Москва",
+        "delivery_city": "Москва",
+        "delivery_office_code": None,
+    }
+
+
+def test_creates_cdek_door_order_and_persists_structured_address(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {
+        "method": "cdek",
+        "type": "door",
+        "region": "Москва",
+        "city": "Москва",
+        "postcode": "115054",
+        "street": "Дубининская",
+        "house": "53",
+        "apartment": "12",
+    }
+
+    response = _post_order(client, payload, key="cdek-door-order-key-0001")
+
+    assert response.status_code == 201
+    with app.state.context.database.connection() as connection:
+        stored = connection.execute(
+            """
+            SELECT delivery_method, delivery_type, delivery_region, delivery_city,
+                   delivery_postcode, delivery_street, delivery_house,
+                   delivery_apartment, delivery_office_code
+            FROM orders WHERE id = ?
+            """,
+            (response.json()["orderId"],),
+        ).fetchone()
+    assert stored is not None
+    assert dict(stored) == {
+        "delivery_method": "cdek",
+        "delivery_type": "door",
+        "delivery_region": "Москва",
+        "delivery_city": "Москва",
+        "delivery_postcode": "115054",
+        "delivery_street": "Дубининская",
+        "delivery_house": "53",
+        "delivery_apartment": "12",
+        "delivery_office_code": None,
+    }
+
+
+def test_rejects_cdek_without_delivery_type(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {"method": "cdek", "city": "Москва"}
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("code") == "REQUIRED_CDEK_TYPE"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_cdek_pickup_without_city(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {"method": "cdek", "type": "pickup"}
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("code") == "REQUIRED_CITY"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_cdek_door_without_street(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {
+        "method": "cdek",
+        "type": "door",
+        "city": "Москва",
+        "house": "53",
+    }
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("code") == "REQUIRED_STREET"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_cdek_door_without_house(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {
+        "method": "cdek",
+        "type": "door",
+        "city": "Москва",
+        "street": "Дубининская",
+    }
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("code") == "REQUIRED_HOUSE"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_office_code_for_cdek_door_delivery(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {
+        "method": "cdek",
+        "type": "door",
+        "city": "Москва",
+        "street": "Дубининская",
+        "house": "53",
+        "officeCode": "MSK123",
+    }
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("code") == "OFFICE_CODE_NOT_ALLOWED"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_cdek_fields_for_self_pickup(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {"method": "self_pickup", "city": "Москва"}
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("code") == "DELIVERY_FIELDS_NOT_ALLOWED"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_door_address_fields_for_cdek_pickup(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = {
+        "method": "cdek",
+        "type": "pickup",
+        "city": "Москва",
+        "street": "Дубининская",
+    }
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("code") == "DOOR_FIELDS_NOT_ALLOWED"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        {"method": "transport", "transportCompany": "СДЭК"},
+        {"method": "pek"},
+        {"method": "ozon"},
+    ],
+)
+def test_rejects_obsolete_or_arbitrary_delivery_methods(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    delivery: dict[str, object],
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = delivery
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("field") == "delivery.method"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
 
 
 def test_creates_business_order_and_persists_required_company(
@@ -291,7 +586,7 @@ def test_rejects_obsolete_legal_buyer_type(
     ("section", "field", "expected_path"),
     [
         ("buyer", "contactName", "buyer.contactName"),
-        ("delivery", "region", "delivery.region"),
+        ("delivery", "method", "delivery.method"),
     ],
 )
 def test_rejects_missing_required_fields(

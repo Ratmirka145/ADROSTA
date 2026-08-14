@@ -343,15 +343,40 @@ def _validation_detail(error: Mapping[str, Any]) -> ErrorDetail:
             code="KPP_NOT_ALLOWED",
             message="Для ИП КПП не указывается.",
         ),
-        "delivery_destination_required": ErrorDetail(
-            field="delivery",
-            code="REQUIRED_DELIVERY_DESTINATION",
-            message="Укажите пункт выдачи или адрес доставки.",
+        "cdek_type_required": ErrorDetail(
+            field="delivery.type",
+            code="REQUIRED_CDEK_TYPE",
+            message="Для доставки СДЭК выберите способ получения.",
         ),
-        "delivery_destination_conflict": ErrorDetail(
+        "cdek_city_required": ErrorDetail(
+            field="delivery.city",
+            code="REQUIRED_CITY",
+            message="Для доставки СДЭК укажите город.",
+        ),
+        "cdek_street_required": ErrorDetail(
+            field="delivery.street",
+            code="REQUIRED_STREET",
+            message="Для доставки СДЭК до адреса укажите улицу.",
+        ),
+        "cdek_house_required": ErrorDetail(
+            field="delivery.house",
+            code="REQUIRED_HOUSE",
+            message="Для доставки СДЭК до адреса укажите номер дома.",
+        ),
+        "delivery_fields_not_allowed": ErrorDetail(
             field="delivery",
-            code="DELIVERY_DESTINATION_CONFLICT",
-            message="Укажите только пункт выдачи или только адрес доставки.",
+            code="DELIVERY_FIELDS_NOT_ALLOWED",
+            message="Для самовывоза данные СДЭК не требуются.",
+        ),
+        "cdek_door_fields_not_allowed": ErrorDetail(
+            field="delivery",
+            code="DOOR_FIELDS_NOT_ALLOWED",
+            message="Для доставки до ПВЗ не указывайте адрес получателя.",
+        ),
+        "cdek_office_not_allowed": ErrorDetail(
+            field="delivery.officeCode",
+            code="OFFICE_CODE_NOT_ALLOWED",
+            message="Код ПВЗ нельзя указывать для доставки СДЭК до двери.",
         ),
         "duplicate_sku": ErrorDetail(
             field="items",

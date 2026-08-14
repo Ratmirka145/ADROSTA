@@ -16,7 +16,17 @@ from pathlib import Path
 from typing import Iterator, Optional, Union
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+_DELIVERY_V2_COLUMNS = {
+    "delivery_type": "TEXT",
+    "delivery_office_code": "TEXT",
+    "delivery_postcode": "TEXT",
+    "delivery_street": "TEXT",
+    "delivery_house": "TEXT",
+    "delivery_apartment": "TEXT",
+}
 
 
 SCHEMA_SQL = """
@@ -56,15 +66,15 @@ CREATE TABLE IF NOT EXISTS orders (
     company_inn TEXT,
     company_kpp TEXT,
     company_legal_address TEXT,
-    delivery_method TEXT NOT NULL,
-    delivery_company TEXT,
+    delivery_method TEXT NOT NULL CHECK (delivery_method IN ('self_pickup', 'cdek')),
+    delivery_type TEXT CHECK (delivery_type IS NULL OR delivery_type IN ('pickup', 'door')),
     delivery_region TEXT,
     delivery_city TEXT,
-    delivery_pickup_point TEXT,
-    delivery_address TEXT,
-    delivery_unloading_required INTEGER
-        CHECK (delivery_unloading_required IS NULL OR delivery_unloading_required IN (0, 1)),
-    delivery_access_restrictions TEXT,
+    delivery_office_code TEXT,
+    delivery_postcode TEXT,
+    delivery_street TEXT,
+    delivery_house TEXT,
+    delivery_apartment TEXT,
     recipient_contact_name TEXT,
     recipient_phone TEXT,
     recipient_email TEXT,
@@ -261,6 +271,15 @@ class Database:
         with self._anchor_lock:
             with self.connection() as connection:
                 connection.executescript(SCHEMA_SQL)
+                order_columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(orders)")
+                }
+                for name, column_type in _DELIVERY_V2_COLUMNS.items():
+                    if name not in order_columns:
+                        connection.execute(
+                            f"ALTER TABLE orders ADD COLUMN {name} {column_type}"
+                        )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
 
     def close(self) -> None:

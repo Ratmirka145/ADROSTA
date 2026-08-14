@@ -126,11 +126,51 @@
     return value === undefined || value === null ? undefined : value;
   }
 
+  function buildDeliveryPayload(delivery) {
+    var payload;
+    if (delivery.method === "self_pickup") {
+      payload = { method: "self_pickup" };
+    } else if (delivery.method === "cdek" && delivery.type === "pickup") {
+      payload = {
+        method: "cdek",
+        type: "pickup",
+        region: optional(delivery.region),
+        city: delivery.city,
+        officeCode: optional(delivery.officeCode)
+      };
+    } else if (delivery.method === "cdek" && delivery.type === "door") {
+      payload = {
+        method: "cdek",
+        type: "door",
+        region: optional(delivery.region),
+        city: delivery.city,
+        postcode: optional(delivery.postcode),
+        street: delivery.street,
+        house: delivery.house,
+        apartment: optional(delivery.apartment)
+      };
+    } else {
+      throw new AdrostaOrderError({
+        code: "CLIENT_VALIDATION_ERROR",
+        message: "Выберите самовывоз или способ доставки СДЭК."
+      });
+    }
+
+    if (delivery.recipient !== undefined && delivery.recipient !== null) {
+      var recipient = requireObject(delivery.recipient, "получатель");
+      payload.recipient = {
+        contactName: recipient.contactName,
+        phone: recipient.phone,
+        email: optional(recipient.email)
+      };
+    }
+    return payload;
+  }
+
   function buildPayload(source) {
     var order = requireObject(source, "заказ");
     var buyer = requireObject(order.buyer, "покупатель");
     var delivery = requireObject(order.delivery, "доставка");
-    var recipient = requireObject(delivery.recipient, "получатель");
 
     if (!Array.isArray(order.items) || order.items.length === 0) {
       throw new AdrostaOrderError({
@@ -146,21 +186,7 @@
         phone: buyer.phone,
         email: buyer.email
       },
-      delivery: {
-        method: delivery.method,
-        transportCompany: optional(delivery.transportCompany),
-        region: delivery.region,
-        city: delivery.city,
-        pickupPoint: optional(delivery.pickupPoint),
-        address: optional(delivery.address),
-        unloadingRequired: delivery.unloadingRequired,
-        accessRestrictions: optional(delivery.accessRestrictions),
-        recipient: {
-          contactName: recipient.contactName,
-          phone: recipient.phone,
-          email: optional(recipient.email)
-        }
-      },
+      delivery: buildDeliveryPayload(delivery),
       comment: optional(order.comment),
       items: order.items.map(function copyTrustedItemFields(item, index) {
         var sourceItem = requireObject(item, "товар " + (index + 1));

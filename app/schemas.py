@@ -19,7 +19,6 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     Field,
-    StrictBool,
     StrictInt,
     StringConstraints,
     field_validator,
@@ -122,6 +121,16 @@ class BuyerType(str, Enum):
     BUSINESS = "business"
 
 
+class DeliveryMethod(str, Enum):
+    SELF_PICKUP = "self_pickup"
+    CDEK = "cdek"
+
+
+class CdekDeliveryType(str, Enum):
+    PICKUP = "pickup"
+    DOOR = "door"
+
+
 class Buyer(ApiModel):
     type: BuyerType
     contact_name: NonEmpty200
@@ -167,21 +176,25 @@ class Recipient(ApiModel):
 
 
 class Delivery(ApiModel):
-    method: NonEmpty100
-    transport_company: NonEmpty200 | None = None
-    region: NonEmpty200
-    city: NonEmpty200
-    pickup_point: NonEmpty500 | None = None
-    address: NonEmpty500 | None = None
-    unloading_required: StrictBool
-    access_restrictions: Annotated[str | None, Field(max_length=1_000)] = None
-    recipient: Recipient
+    method: DeliveryMethod
+    type: CdekDeliveryType | None = None
+    region: NonEmpty200 | None = None
+    city: NonEmpty200 | None = None
+    office_code: NonEmpty100 | None = None
+    postcode: NonEmpty64 | None = None
+    street: NonEmpty500 | None = None
+    house: NonEmpty100 | None = None
+    apartment: NonEmpty100 | None = None
+    recipient: Recipient | None = None
 
     @field_validator(
-        "transport_company",
-        "pickup_point",
-        "address",
-        "access_restrictions",
+        "region",
+        "city",
+        "office_code",
+        "postcode",
+        "street",
+        "house",
+        "apartment",
         mode="before",
     )
     @classmethod
@@ -189,16 +202,61 @@ class Delivery(ApiModel):
         return _blank_to_none(value)
 
     @model_validator(mode="after")
-    def validate_destination(self) -> Delivery:
-        if self.pickup_point is None and self.address is None:
+    def validate_delivery_contract(self) -> Delivery:
+        cdek_fields = (
+            self.type,
+            self.region,
+            self.city,
+            self.office_code,
+            self.postcode,
+            self.street,
+            self.house,
+            self.apartment,
+        )
+        if self.method is DeliveryMethod.SELF_PICKUP:
+            if any(value is not None for value in cdek_fields):
+                raise PydanticCustomError(
+                    "delivery_fields_not_allowed",
+                    "CDEK fields must be omitted for self pickup",
+                )
+            return self
+
+        if self.type is None:
             raise PydanticCustomError(
-                "delivery_destination_required",
-                "pickupPoint or address is required",
+                "cdek_type_required",
+                "delivery type is required for CDEK",
             )
-        if self.pickup_point is not None and self.address is not None:
+        if self.city is None:
             raise PydanticCustomError(
-                "delivery_destination_conflict",
-                "pickupPoint and address cannot be used together",
+                "cdek_city_required",
+                "city is required for CDEK delivery",
+            )
+
+        if self.type is CdekDeliveryType.PICKUP:
+            if any(
+                value is not None
+                for value in (self.postcode, self.street, self.house, self.apartment)
+            ):
+                raise PydanticCustomError(
+                    "cdek_door_fields_not_allowed",
+                    "door address fields must be omitted for CDEK pickup",
+                )
+            return self
+
+        if self.street is None:
+            raise PydanticCustomError(
+                "cdek_street_required",
+                "street is required for CDEK door delivery",
+            )
+        if self.house is None:
+            raise PydanticCustomError(
+                "cdek_house_required",
+                "house is required for CDEK door delivery",
+            )
+        if self.office_code is not None:
+            raise PydanticCustomError(
+                "cdek_office_not_allowed",
+                "office code must be omitted for CDEK door delivery",
             )
         return self
 
@@ -308,9 +366,11 @@ __all__ = [
     "ApiModel",
     "Buyer",
     "BuyerType",
+    "CdekDeliveryType",
     "CalculatedItemResponse",
     "Company",
     "Delivery",
+    "DeliveryMethod",
     "NormalizedEmail",
     "OrderCalculationResponse",
     "OrderCreate",
