@@ -23,11 +23,9 @@ ADROSTA_PRICE_TIERS = (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
-        description="Управление локальной базой ADROSTA без JSON-файлов.",
+        description="Управление каталогом ADROSTA в PostgreSQL.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("init-db", help="Создать таблицы SQLite")
-
     catalog = commands.add_parser("catalog", help="Операции с каталогом ADROSTA")
     catalog_commands = catalog.add_subparsers(dest="catalog_command", required=True)
     catalog_commands.add_parser(
@@ -59,22 +57,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def _database() -> Database:
     settings = get_settings()
-    database = Database(
-        settings.database_path,
-        busy_timeout_ms=settings.sqlite_busy_timeout_ms,
-    )
-    database.initialize()
-    return database
+    return Database(settings.database_url)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         database = _database()
-        if args.command == "init-db":
-            print("База данных готова.")
-            return 0
-
         products = ProductRepository(database)
         if args.command == "catalog":
             for sku, name in (

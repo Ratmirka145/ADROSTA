@@ -15,7 +15,7 @@ async def health_check():
 
 
 @router.get("/ready")
-async def readiness_check(request: Request) -> JSONResponse:
+def readiness_check(request: Request) -> JSONResponse:
     result = request.app.state.context.order_service.readiness()
     return JSONResponse(
         status_code=(

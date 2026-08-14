@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import sqlite3
-
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.security import resolve_client_ip
 
@@ -31,13 +31,14 @@ class OrderRateLimitMiddleware(BaseHTTPMiddleware):
             request.state.client_ip = client_ip
             if context.rate_limits is not None:
                 try:
-                    rate_result = context.rate_limits.consume(
+                    rate_result = await run_in_threadpool(
+                        context.rate_limits.consume,
                         client_ip,
                         limit=context.settings.order_rate_limit_count,
                         window_seconds=context.settings.order_rate_limit_window_seconds,
                     )
                     request.state.rate_limit_result = rate_result
-                except sqlite3.Error:
+                except SQLAlchemyError:
                     request.state.rate_limit_error = True
                     return self._error_response(
                         request,

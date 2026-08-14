@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import os
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import event
+
+# app.main exposes a module-level ASGI app, so collection needs an explicit
+# isolated test URL before importing it.
+os.environ.setdefault("APP_ENV", "test")
+os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
 from app.config import Settings
 from app.main import create_app
+from app.models import Base
 from app.repositories import Product, ProductPriceTier
 
 
@@ -68,7 +76,7 @@ def settings_factory(
             "DEBUG": "false",
             "API_DOCS_ENABLED": "false",
             "LOG_LEVEL": "WARNING",
-            "DATABASE_PATH": str(database_path),
+            "DATABASE_URL": f"sqlite+pysqlite:///{database_path}",
             "CORS_ALLOWED_ORIGINS": ALLOWED_ORIGIN,
             "APP_HASH_SECRET": "test-only-hmac-secret-never-use-in-production",
             "ORDER_RATE_LIMIT_COUNT": "100",
@@ -95,6 +103,18 @@ def app_factory(
 
     def make_app(*, seed_products: bool = True, **settings_overrides: object) -> FastAPI:
         application = create_app(settings_factory(**settings_overrides))
+        engine = application.state.context.database.engine
+
+        @event.listens_for(engine, "connect")
+        def enable_sqlite_foreign_keys(
+            dbapi_connection: object, connection_record: object
+        ) -> None:
+            del connection_record
+            cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+            cursor.execute("PRAGMA foreign_keys = ON")
+            cursor.close()
+
+        Base.metadata.create_all(engine)
         if seed_products:
             _seed_products(application)
         applications.append(application)

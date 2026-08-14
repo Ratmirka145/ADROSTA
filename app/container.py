@@ -26,11 +26,7 @@ class ApplicationContext:
 
     @classmethod
     def build(cls, settings: Settings) -> "ApplicationContext":
-        database = Database(
-            settings.database_path,
-            busy_timeout_ms=settings.sqlite_busy_timeout_ms,
-        )
-        database.initialize()
+        database = Database(settings.database_url)
         products = ProductRepository(database)
         outbox = OutboxRepository(database)
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
-import sqlite3
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import ConfigError, Settings
 from app.domain import (
@@ -138,7 +139,7 @@ class OrderService:
             )
         except RepositoryIdempotencyConflictError:
             raise ApiIdempotencyConflictError() from None
-        except (ConfigError, sqlite3.Error, RepositoryError):
+        except (ConfigError, SQLAlchemyError, RepositoryError):
             raise ServiceUnavailableError() from None
 
         if replay is not None:
@@ -163,7 +164,7 @@ class OrderService:
                     window_seconds=self.settings.order_rate_limit_window_seconds,
                     now=now,
                 )
-            except sqlite3.Error:
+            except SQLAlchemyError:
                 raise ServiceUnavailableError() from None
         if not rate_limit_result.allowed:
             raise RateLimitError(
@@ -190,7 +191,7 @@ class OrderService:
             raise ValidationAppError() from None
         except ConfigError:
             raise ServiceUnavailableError() from None
-        except sqlite3.Error:
+        except SQLAlchemyError:
             raise ServiceUnavailableError() from None
         except RepositoryError:
             raise ServiceUnavailableError() from None
@@ -233,7 +234,7 @@ class OrderService:
             raise PriceTierNotFoundError() from None
         except (AmbiguousPriceTierError, CatalogIntegrityError):
             raise CatalogUnavailableError() from None
-        except sqlite3.Error:
+        except SQLAlchemyError:
             raise CatalogUnavailableError() from None
 
     def readiness(self) -> ReadinessResult:
@@ -244,11 +245,10 @@ class OrderService:
             "destination": "configured" if self.settings.webhook_enabled else "store_only",
         }
         try:
-            with self.products.database.connection() as connection:
-                connection.execute("SELECT 1").fetchone()
+            self.products.database.ping()
             checks["database"] = "ok"
             checks["catalog"] = "ok" if self.products.count() > 0 else "empty"
-        except sqlite3.Error:
+        except SQLAlchemyError:
             pass
 
         destination_ready = self.settings.webhook_enabled or self.settings.allow_store_only
@@ -314,7 +314,7 @@ class OrderService:
     ) -> Literal["pending", "stored", "delivered", "failed"]:
         try:
             message = self.outbox.get_for_order(order_id)
-        except sqlite3.Error:
+        except SQLAlchemyError:
             return "pending" if self.settings.webhook_enabled else "stored"
         if message is None:
             return "stored"

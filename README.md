@@ -1,8 +1,8 @@
 # ADROSTA Backend — Stage 01
 
-Production-oriented backend формы оптового заказа ADROSTA на **Python 3.12, FastAPI и SQLite**. Проект продолжает исходный FastAPI-skeleton из приложенного архива: второй backend и другой технологический стек не создавались.
+Production-oriented backend формы оптового заказа ADROSTA на **Python 3.12, FastAPI, SQLAlchemy 2 и PostgreSQL 18**. Проект продолжает исходный FastAPI-skeleton из приложенного архива: второй backend не создавался.
 
-Каталог не хранится в JSON-файлах. Товары добавляются Python-командой в SQLite. Браузер технически передаёт тело HTTP-запроса в формате JSON, потому что это стандартный формат FastAPI, но вручную создавать или редактировать `.json` не требуется: для проверки запроса есть Swagger, а для Tilda — готовый клиент в `examples/tilda-api-client.js`.
+Каталог не хранится в JSON-файлах. Товары добавляются Python-командой в PostgreSQL. Браузер технически передаёт тело HTTP-запроса в формате JSON, потому что это стандартный формат FastAPI, но вручную создавать или редактировать `.json` не требуется: для проверки запроса есть Swagger, а для Tilda — готовый клиент в `examples/tilda-api-client.js`.
 
 ## Аудит исходного архива
 
@@ -29,7 +29,7 @@ Production-oriented backend формы оптового заказа ADROSTA н�
 
 ## Текущая архитектура
 
-Приложение остаётся компактным монолитом FastAPI с одной SQLite-базой:
+Приложение остаётся компактным монолитом FastAPI с одной PostgreSQL-базой:
 
 ```mermaid
 flowchart LR
@@ -37,7 +37,7 @@ flowchart LR
     C -->|"POST /api/orders + Idempotency-Key"| A["FastAPI"]
     A --> V["Pydantic: проверка и нормализация"]
     V --> S["Сервис заказа"]
-    S -->|"SKU + boxes"| DB[("SQLite: товары и price tiers")]
+    S -->|"SKU + boxes"| DB[("PostgreSQL: товары и price tiers")]
     S --> D["Единый domain calculator"]
     D -->|"рассчитанный snapshot"| O[("заказ, снимок товара, idempotency, outbox")]
     O --> A
@@ -55,7 +55,8 @@ flowchart LR
 | `app/routers/orders.py` | `POST /api/orders` |
 | `app/routers/cart.py` | Предварительный `POST /api/cart/calculate` без записи заказа |
 | `app/routers/health.py` | Liveness `GET /health` и readiness `GET /ready` |
-| `app/database.py` | Схема SQLite, WAL, foreign keys и транзакции |
+| `app/database.py`, `app/models.py` | SQLAlchemy engine/session и единый Declarative Base |
+| `alembic/` | Версионированные миграции PostgreSQL |
 | `app/repositories.py` | Каталог, заказ, снимки характеристик, дедупликация, rate limit, outbox |
 | `app/domain.py` | Единственный расчёт цены, количества, груза и totals |
 | `app/services.py` | Оркестрация заказа и фоновой доставки |
@@ -64,7 +65,7 @@ flowchart LR
 | `app/security.py` | HMAC-отпечатки, проверка idempotency key, доверенные proxy IP |
 | `app/errors.py` | Единый безопасный формат ошибок без отражения введённых данных |
 | `app/observability.py` | Request ID, метаданные запросов и ограничение размера тела без логирования PII |
-| `app/cli.py` | Управление SQLite-каталогом Python-командами, без JSON-файлов |
+| `app/cli.py` | Управление PostgreSQL-каталогом Python-командами, без JSON-файлов |
 | `app/worker.py` | Доставка outbox-сообщений во внешний webhook |
 | `examples/tilda-api-client.js` | Изолированный клиент для подключения к существующему Tilda handler |
 | `tests/` | Маршрутные, валидационные и инфраструктурные тесты |
@@ -77,14 +78,14 @@ flowchart LR
 - реквизиты компании обязательны для `buyer.type = business` и запрещены для `individual`;
 - строгий выбор получения заказа: самовывоз либо СДЭК до ПВЗ/двери;
 - приём от клиента только `sku` и `boxes` для каждой позиции;
-- точный, регистрозависимый поиск активного SKU в SQLite;
+- точный, регистрозависимый поиск активного SKU в PostgreSQL;
 - серверный расчёт units, SKU-specific price tier, точной цены в копейках, веса, объёма и грузовых мест;
 - атомарное сохранение заказа и снимка характеристик товара на момент заказа;
 - обязательный `Idempotency-Key`, повтор ответа на безопасный retry и защита от похожего повторного заказа;
-- SQLite rate limit по HMAC-отпечатку IP;
+- PostgreSQL rate limit по HMAC-отпечатку IP;
 - точный список CORS origins, trusted hosts и ограниченный размер запроса;
 - логи только с метаданными и request ID, без тела заказа и полных персональных данных;
-- надёжный SQLite outbox и отдельный worker с повторными попытками webhook;
+- надёжный PostgreSQL outbox с `FOR UPDATE SKIP LOCKED` и отдельный worker;
 - health/readiness, Swagger в development и Docker healthcheck.
 
 ### Что намеренно не реализовано без исходных данных
@@ -94,7 +95,7 @@ flowchart LR
 - правки существующей формы Tilda: её HTML/CSS/JS не было в архиве;
 - административный интерфейс, выгрузка заказов, политика удаления PII и резервное копирование как сервис.
 
-SQLite содержит персональные данные заказов. Доступ к файлу базы и резервным копиям должен быть ограничен, а срок хранения необходимо определить отдельно.
+PostgreSQL содержит персональные данные заказов. Доступ к базе и резервным копиям должен быть ограничен, а срок хранения необходимо определить отдельно.
 
 ## Локальный запуск
 
@@ -115,10 +116,11 @@ Copy-Item .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Инициализируйте базу и идемпотентно загрузите реальный каталог ADROSTA:
+Запустите PostgreSQL, примените миграции и идемпотентно загрузите каталог ADROSTA:
 
 ```powershell
-python -m app.cli init-db
+docker compose up -d postgres
+python -m alembic upgrade head
 python -m app.cli catalog seed-adrosta
 python -m app.cli product list
 ```
@@ -145,14 +147,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 cp .env.example .env
-python -m app.cli init-db
+docker compose up -d postgres
+python -m alembic upgrade head
 python -m app.cli catalog seed-adrosta
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
 ## Каталог товаров без JSON
 
-SQLite-файл создаётся автоматически по `DATABASE_PATH`. Габариты вводятся в миллиметрах, вес одной коробки — в граммах; объём рассчитывается CLI. Используйте только проверенные складские/товарные данные.
+Схема создаётся только командой `python -m alembic upgrade head`; приложение не вызывает `create_all()` при старте. Габариты вводятся в миллиметрах, вес одной коробки — в граммах; объём рассчитывается CLI. Используйте только проверенные складские/товарные данные.
 
 ```powershell
 # Добавить новый SKU или обновить существующий
@@ -171,9 +174,18 @@ python -m app.cli product activate --sku "SKU-001"
 
 Неактивный или отсутствующий SKU для публичного API считается неизвестным. Регистр важен: `SKU-001` и `sku-001` — разные значения.
 
+### Переход с локальной SQLite-базы
+
+Initial Alembic migration создаёт пустую PostgreSQL-схему. Автоматический перенос
+старого `.sqlite3` не выполняется: текущие данные считались dev/test данными, а
+каталог восстанавливается идемпотентной командой `catalog seed-adrosta`. Если в
+SQLite окажутся необходимые реальные заказы, нужен отдельный проверяемый export/
+import с валидацией количества строк и snapshot-полей; запускать такой перенос
+как побочный эффект старта API нельзя.
+
 ## Server-side pricing
 
-Frontend передаёт для каждой позиции только `sku` и целое `boxes >= 1`. Поля `unitsPerBox`, цены, суммы, веса, габаритов и totals запрещены входной схемой. Backend загружает из SQLite канонические `name`, `units_per_box`, вес и габариты одной коробки, затем выбирает price tier и рассчитывает позиции и итог корзины в одном `app.domain.calculate_order()`. Этот же calculator используется при предварительном расчёте и при создании заказа; repository сохраняет готовый snapshot и не выбирает тариф.
+Frontend передаёт для каждой позиции только `sku` и целое `boxes >= 1`. Поля `unitsPerBox`, цены, суммы, веса, габаритов и totals запрещены входной схемой. Backend загружает из PostgreSQL канонические `name`, `units_per_box`, вес и габариты одной коробки, затем выбирает price tier и рассчитывает позиции и итог корзины в одном `app.domain.calculate_order()`. Этот же calculator используется при предварительном расчёте и при создании заказа; repository сохраняет готовый snapshot и не выбирает тариф.
 
 Команда `python -m app.cli catalog seed-adrosta` безопасна при повторном запуске и создаёт/обновляет:
 
@@ -383,8 +395,8 @@ Backend возвращает только канонические технич�
 | `DEBUG` | В production только `false` |
 | `API_DOCS_ENABLED` | Swagger/ReDoc/OpenAPI; в production только `false` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
-| `DATABASE_PATH` | SQLite; в production абсолютный путь на persistent volume |
-| `SQLITE_BUSY_TIMEOUT_MS` | Ожидание блокировки SQLite |
+| `DATABASE_URL` | SQLAlchemy URL вида `postgresql+psycopg://user:password@host:5432/database`; обязателен |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | Параметры только для Compose PostgreSQL; приложение читает `DATABASE_URL` |
 | `CORS_ALLOWED_ORIGINS` | Точные origins Tilda через запятую, без `*`, path и завершающего `/`; в production только HTTPS |
 | `ALLOWED_HOSTS` | Точные DNS-hostnames/IPv4 API через запятую; без схемы URL и порта |
 | `TRUSTED_PROXY_IPS` | IP/CIDR только фактически доверенных reverse proxy |
@@ -410,7 +422,7 @@ Backend возвращает только канонические технич�
 | `OUTBOX_LOCK_SECONDS` | Lease сообщения для безопасной обработки |
 | `ALLOW_STORE_ONLY` | Явно разрешить production без получателя; обычно `false` |
 
-Production-конфигурация проверяется при старте. Wildcard CORS, относительная/временная база, слабый секрет, HTTP webhook, включённый debug/docs и противоречивые outbox-настройки приводят к отказу запуска.
+Production-конфигурация проверяется при старте. Runtime принимает только драйвер `postgresql+psycopg`; wildcard CORS, слабый секрет, HTTP webhook, включённый debug/docs и противоречивые outbox-настройки приводят к отказу запуска. Не помещайте пароль базы в логи или frontend.
 
 ## Webhook worker
 
@@ -435,6 +447,30 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+Основной набор использует тот же SQLAlchemy repository слой с изолированной
+SQLite in-memory/file базой только как быстрый test double. Runtime-конфигурация
+development/production SQLite не принимает. Для обязательной проверки реального
+PostgreSQL укажите URL отдельной disposable test database:
+
+```powershell
+$env:TEST_DATABASE_URL="postgresql+psycopg://user:password@127.0.0.1:5432/adrosta_test"
+python -m pytest -q -m integration
+```
+
+Integration-тест сам выполняет `alembic upgrade head`, очищает только указанную
+test database, дважды запускает seed через repository и проверяет cart, order,
+idempotency concurrency и outbox. Не указывайте в `TEST_DATABASE_URL` production
+database.
+
+При изменении моделей создайте ревизию только на локальной PostgreSQL-базе,
+просмотрите сгенерированный файл и проверьте отсутствие незаписанных изменений:
+
+```powershell
+python -m alembic revision --autogenerate -m "describe schema change"
+python -m alembic upgrade head
+python -m alembic check
+```
+
 Набор тестов должен оставаться обязательным перед деплоем и проверять как минимум:
 
 - health/readiness и успешный заказ;
@@ -448,59 +484,62 @@ python -m pytest -q
 - недоступность/отказ webhook, retry и окончательный статус outbox;
 - строгий CORS и отсутствие секретов в клиентском файле.
 
-## Docker: один экземпляр и постоянный volume
+## Docker Compose и PostgreSQL
 
-Соберите образ:
+`compose.yaml` запускает только PostgreSQL 18.4, публикует его на локальном
+`127.0.0.1:5432`, хранит данные в named volume и проверяет готовность через
+`pg_isready`. API и worker остаются обычными Python-процессами.
+
+```powershell
+Copy-Item .env.example .env
+# замените POSTGRES_PASSWORD и тот же пароль внутри DATABASE_URL
+docker compose up -d postgres
+docker compose ps
+python -m alembic upgrade head
+python -m app.cli catalog seed-adrosta
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+Для локального сброса тестовой базы остановите процессы и выполните
+`docker compose down -v`; флаг `-v` безвозвратно удаляет локальный volume.
+Обычный `docker compose down` данные сохраняет.
+
+Образ приложения содержит Alembic, но не применяет миграции автоматически:
 
 ```powershell
 docker build -t adrosta-backend:stage-01 .
-docker volume create adrosta-data
+docker run --rm --env-file .env --network host adrosta-backend:stage-01 python -m alembic upgrade head
+docker run -d --name adrosta-api --restart unless-stopped --env-file .env --network host adrosta-backend:stage-01
 ```
 
-В production `.env` укажите реальные значения, а путь базы для контейнера задайте абсолютным `/app/data/adrosta.sqlite3`. `ALLOWED_HOSTS` должен включать публичный API hostname и `127.0.0.1`, используемый встроенным healthcheck.
-
-```powershell
-docker run -d --name adrosta-api --restart unless-stopped --env-file .env -e DATABASE_PATH=/app/data/adrosta.sqlite3 -v adrosta-data:/app/data -p 127.0.0.1:8000:8000 adrosta-backend:stage-01
-```
-
-Каталог заполняется тем же образом, без JSON:
-
-```powershell
-docker run --rm --env-file .env -e DATABASE_PATH=/app/data/adrosta.sqlite3 -v adrosta-data:/app/data adrosta-backend:stage-01 python -m app.cli product upsert --sku "REAL-SKU" --name "Реальный товар" --weight-grams 12500 --length-mm 600 --width-mm 400 --height-mm 250
-```
-
-Если webhook включён, запустите отдельный worker с тем же volume и тем же env:
-
-```powershell
-docker run -d --name adrosta-worker --restart unless-stopped --env-file .env -e DATABASE_PATH=/app/data/adrosta.sqlite3 -v adrosta-data:/app/data adrosta-backend:stage-01 python -m app.worker
-```
-
-Запускайте один API-контейнер с одним Uvicorn worker, как задано в `Dockerfile`. Не масштабируйте SQLite-приложение на несколько узлов и не размещайте базу на сетевой файловой системе. Для горизонтального масштабирования сначала потребуется согласованная миграция хранилища, а не второй backend.
+В production сначала применяйте миграции отдельным release-job, затем запускайте
+API и при включённом webhook отдельный `python -m app.worker`. PostgreSQL допускает
+несколько API/worker процессов; outbox claim использует row locks и `SKIP LOCKED`.
 
 ## Checklist деплоя
 
 1. Получить реальный HTTPS hostname API и настроить TLS/reverse proxy.
 2. Создать production `.env` вне Git: `APP_ENV=production`, `DEBUG=false`, `API_DOCS_ENABLED=false`.
-3. Указать абсолютный `DATABASE_PATH` на persistent volume и проверить права непривилегированного пользователя контейнера.
+3. Создать PostgreSQL database/user, сохранить секретный `DATABASE_URL` и выполнить `python -m alembic upgrade head`.
 4. Сгенерировать уникальный `APP_HASH_SECRET`; сохранить его в secret manager/на хосте, не в Tilda.
 5. Внести точные опубликованные Tilda origins в `CORS_ALLOWED_ORIGINS`; отдельно перечислить API hostname и healthcheck IP в `ALLOWED_HOSTS`.
 6. Если reverse proxy передаёт `X-Forwarded-For`, внести только его реальные IP/CIDR в `TRUSTED_PROXY_IPS`.
 7. Загрузить все реальные активные SKU через `python -m app.cli product upsert` и сверить граммы/миллиметры с источником данных.
 8. Выбрать режим: настроить реальный HTTPS webhook и worker либо осознанно включить `ALLOW_STORE_ONLY=true`.
 9. Выполнить тесты, затем проверить `/health` и `/ready` на целевом окружении.
-10. Настроить резервное копирование SQLite volume и тест восстановления. Для простой файловой копии остановить API и worker; для работы без остановки использовать согласованный SQLite online backup.
+10. Настроить PostgreSQL backup (`pg_dump`/управляемые snapshots), retention и регулярный тест восстановления.
 11. Настроить мониторинг HTTP 5xx, `not_ready`, падения worker и сообщений outbox со статусом `failed`.
 12. Определить срок хранения PII, доступ операторов и процедуру удаления/выгрузки заказов.
 13. Разместить версионированный `examples/tilda-api-client.js`, встроить вызов в существующий handler и опубликовать страницу Tilda.
-14. Сделать реальный тест физлица и юрлица, проверить заказ в SQLite и в конечном внешнем сервисе.
+14. Сделать реальный тест физлица и юрлица, проверить заказ в PostgreSQL и в конечном внешнем сервисе.
 
 ## Что нужно предоставить/настроить вручную
 
 - публичный HTTPS URL backend;
 - точный список опубликованных доменов Tilda, включая варианты с `www` и отдельный preview-домен только если он действительно нужен;
 - список SKU с названием, весом одной коробки и тремя габаритами;
-- выбранный хостинг, путь/volume для SQLite, reverse proxy и его доверенные IP;
-- назначение заявки: только SQLite или конкретная Tilda/CRM/email система;
+- выбранный PostgreSQL-хостинг, backup/restore, reverse proxy и его доверенные IP;
+- назначение заявки: только PostgreSQL или конкретная Tilda/CRM/email система;
 - URL, способ авторизации и ожидаемый контракт внешнего получателя;
 - решение, должна ли после успеха backend дополнительно срабатывать текущая нативная отправка Tilda;
 - политика хранения персональных данных, резервного копирования и доступа.

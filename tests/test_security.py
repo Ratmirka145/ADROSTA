@@ -102,7 +102,7 @@ def _production_env(tmp_path: Path) -> dict[str, str]:
         "APP_ENV": "production",
         "DEBUG": "false",
         "API_DOCS_ENABLED": "false",
-        "DATABASE_PATH": str((tmp_path / "production.sqlite3").resolve()),
+        "DATABASE_URL": "postgresql+psycopg://adrosta:database-secret@db/adrosta",
         "CORS_ALLOWED_ORIGINS": "https://shop.example.test",
         "ALLOWED_HOSTS": "api.example.test",
         "APP_HASH_SECRET": "a-production-secret-with-more-than-32-characters",
@@ -121,6 +121,13 @@ def test_allowed_hosts_rejects_port(tmp_path: Path) -> None:
     environ = _production_env(tmp_path)
     environ["ALLOWED_HOSTS"] = "api.example.test:443"
     with pytest.raises(ConfigError):
+        Settings.from_env(environ, load_env_file=False)
+
+
+def test_production_rejects_sqlite_database_url(tmp_path: Path) -> None:
+    environ = _production_env(tmp_path)
+    environ["DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
+    with pytest.raises(ConfigError, match=r"postgresql\+psycopg"):
         Settings.from_env(environ, load_env_file=False)
 
 
@@ -151,3 +158,4 @@ def test_settings_repr_does_not_expose_secrets(tmp_path: Path) -> None:
     environ = _production_env(tmp_path)
     settings = Settings.from_env(environ, load_env_file=False)
     assert environ["APP_HASH_SECRET"] not in repr(settings)
+    assert "database-secret" not in repr(settings)

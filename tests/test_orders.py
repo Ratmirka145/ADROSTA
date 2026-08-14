@@ -7,6 +7,9 @@ from uuid import UUID
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
+
+from app.models import OrderModel
 
 
 OrderPayloadFactory = Callable[..., dict[str, object]]
@@ -30,8 +33,17 @@ def _error_code(response) -> str:
 
 
 def _order_count(application: FastAPI) -> int:
-    with application.state.context.database.connection() as connection:
-        return int(connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0])
+    with application.state.context.database.session() as session:
+        return int(session.scalar(select(func.count()).select_from(OrderModel)) or 0)
+
+
+def _stored_order(
+    application: FastAPI, order_id: str, *field_names: str
+) -> dict[str, object]:
+    with application.state.context.database.session() as session:
+        order = session.get(OrderModel, order_id)
+        assert order is not None
+        return {name: getattr(order, name) for name in field_names}
 
 
 def test_creates_individual_order_and_recalculates_trusted_totals(
@@ -77,15 +89,9 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
         "totalVolumeMm3": 480_000_000,
     }
 
-    with app.state.context.database.connection() as connection:
-        stored = connection.execute(
-            """
-            SELECT buyer_type, buyer_phone, buyer_email
-            FROM orders WHERE id = ?
-            """,
-            (body["orderId"],),
-        ).fetchone()
-    assert stored is not None
+    stored = _stored_order(
+        app, body["orderId"], "buyer_type", "buyer_phone", "buyer_email"
+    )
     assert stored["buyer_type"] == "individual"
     assert stored["buyer_phone"] == "+79991234567"
     assert stored["buyer_email"] == "buyer@example.com"
@@ -102,18 +108,14 @@ def test_creates_self_pickup_order_and_persists_only_delivery_method(
     response = _post_order(client, payload, key="self-pickup-order-key-0001")
 
     assert response.status_code == 201
-    with app.state.context.database.connection() as connection:
-        stored = connection.execute(
-            """
-            SELECT delivery_method, delivery_type, delivery_region, delivery_city,
-                   delivery_office_code, delivery_postcode, delivery_street,
-                   delivery_house, delivery_apartment
-            FROM orders WHERE id = ?
-            """,
-            (response.json()["orderId"],),
-        ).fetchone()
-    assert stored is not None
-    assert dict(stored) == {
+    stored = _stored_order(
+        app,
+        response.json()["orderId"],
+        "delivery_method", "delivery_type", "delivery_region", "delivery_city",
+        "delivery_office_code", "delivery_postcode", "delivery_street",
+        "delivery_house", "delivery_apartment",
+    )
+    assert stored == {
         "delivery_method": "self_pickup",
         "delivery_type": None,
         "delivery_region": None,
@@ -143,17 +145,13 @@ def test_creates_cdek_pickup_order_and_persists_delivery_fields(
     response = _post_order(client, payload, key="cdek-pickup-order-key-0001")
 
     assert response.status_code == 201
-    with app.state.context.database.connection() as connection:
-        stored = connection.execute(
-            """
-            SELECT delivery_method, delivery_type, delivery_region, delivery_city,
-                   delivery_office_code
-            FROM orders WHERE id = ?
-            """,
-            (response.json()["orderId"],),
-        ).fetchone()
-    assert stored is not None
-    assert dict(stored) == {
+    stored = _stored_order(
+        app,
+        response.json()["orderId"],
+        "delivery_method", "delivery_type", "delivery_region", "delivery_city",
+        "delivery_office_code",
+    )
+    assert stored == {
         "delivery_method": "cdek",
         "delivery_type": "pickup",
         "delivery_region": "Москва",
@@ -182,18 +180,14 @@ def test_creates_cdek_door_order_and_persists_structured_address(
     response = _post_order(client, payload, key="cdek-door-order-key-0001")
 
     assert response.status_code == 201
-    with app.state.context.database.connection() as connection:
-        stored = connection.execute(
-            """
-            SELECT delivery_method, delivery_type, delivery_region, delivery_city,
-                   delivery_postcode, delivery_street, delivery_house,
-                   delivery_apartment, delivery_office_code
-            FROM orders WHERE id = ?
-            """,
-            (response.json()["orderId"],),
-        ).fetchone()
-    assert stored is not None
-    assert dict(stored) == {
+    stored = _stored_order(
+        app,
+        response.json()["orderId"],
+        "delivery_method", "delivery_type", "delivery_region", "delivery_city",
+        "delivery_postcode", "delivery_street", "delivery_house",
+        "delivery_apartment", "delivery_office_code",
+    )
+    assert stored == {
         "delivery_method": "cdek",
         "delivery_type": "door",
         "delivery_region": "Москва",
@@ -400,17 +394,11 @@ def test_creates_business_order_and_persists_required_company(
 
     assert response.status_code == 201
     order_id = response.json()["orderId"]
-    with app.state.context.database.connection() as connection:
-        stored = connection.execute(
-            """
-            SELECT buyer_type, company_name, company_inn, company_kpp,
-                   company_legal_address
-            FROM orders WHERE id = ?
-            """,
-            (order_id,),
-        ).fetchone()
-    assert stored is not None
-    assert dict(stored) == {
+    stored = _stored_order(
+        app, order_id, "buyer_type", "company_name", "company_inn",
+        "company_kpp", "company_legal_address",
+    )
+    assert stored == {
         "buyer_type": "business",
         "company_name": "ООО Тест",
         "company_inn": "7707083893",
@@ -436,16 +424,10 @@ def test_creates_business_order_for_individual_entrepreneur_without_kpp(
 
     assert response.status_code == 201
     order_id = response.json()["orderId"]
-    with app.state.context.database.connection() as connection:
-        stored = connection.execute(
-            """
-            SELECT buyer_type, company_inn, company_kpp
-            FROM orders WHERE id = ?
-            """,
-            (order_id,),
-        ).fetchone()
-    assert stored is not None
-    assert dict(stored) == {
+    stored = _stored_order(
+        app, order_id, "buyer_type", "company_inn", "company_kpp"
+    )
+    assert stored == {
         "buyer_type": "business",
         "company_inn": "123456789012",
         "company_kpp": None,

@@ -12,7 +12,7 @@ def test_application_uses_explicit_test_settings(app: FastAPI) -> None:
     assert settings.app_env == "test"
     assert settings.debug is False
     assert settings.api_docs_enabled is False
-    assert settings.database_path.name.startswith("adrosta-")
+    assert settings.database_url.startswith("sqlite+pysqlite:///")
 
 
 def test_health_and_readiness_are_healthy_with_seeded_catalog(

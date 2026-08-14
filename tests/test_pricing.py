@@ -5,8 +5,10 @@ from collections.abc import Callable
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
 from app.domain import AmbiguousPriceTierError, PriceTier, Product, calculate_order
+from app.models import IdempotencyRecordModel, OrderItemModel, OrderModel, OutboxModel
 from app.repositories import Product as StoredProduct
 from app.repositories import ProductPriceTier
 from app.schemas import OrderItem
@@ -129,15 +131,9 @@ def test_cart_calculation_uses_per_sku_tier_boundaries(
     assert body["totals"]["cargoPlaces"] == boxes
     assert body["totals"]["totalVolumeMm3"] == boxes * 17_490_000
 
-    with application.state.context.database.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM idempotency_records"
-            ).fetchone()[0]
-            == 0
-        )
+    with application.state.context.database.session() as session:
+        for model in (OrderModel, OutboxModel, IdempotencyRecordModel):
+            assert session.scalar(select(func.count()).select_from(model)) == 0
 
 
 def test_cart_calculates_tier_separately_for_each_sku(
@@ -301,26 +297,30 @@ def test_order_persists_calculation_and_price_snapshot(
         "opt-san-green",
         (ProductPriceTier(1, None, 31_000),),
     )
-    with application.state.context.database.connection() as connection:
-        item = connection.execute(
-            """
-            SELECT boxes, units_per_box, units, price_per_unit_kopecks,
-                   price_per_box_kopecks, line_amount_kopecks,
-                   total_weight_grams, cargo_places
-            FROM order_items WHERE order_id = ?
-            """,
-            (order_id,),
-        ).fetchone()
-        order = connection.execute(
-            """
-            SELECT total_boxes, total_units, products_amount_kopecks,
-                   total_weight_grams, cargo_places
-            FROM orders WHERE id = ?
-            """,
-            (order_id,),
-        ).fetchone()
+    with application.state.context.database.session() as session:
+        item = session.scalar(
+            select(OrderItemModel).where(OrderItemModel.order_id == order_id)
+        )
+        order = session.get(OrderModel, order_id)
+        assert item is not None
+        assert order is not None
+        item_values = {
+            name: getattr(item, name)
+            for name in (
+                "boxes", "units_per_box", "units", "price_per_unit_kopecks",
+                "price_per_box_kopecks", "line_amount_kopecks",
+                "total_weight_grams", "cargo_places",
+            )
+        }
+        order_values = {
+            name: getattr(order, name)
+            for name in (
+                "total_boxes", "total_units", "products_amount_kopecks",
+                "total_weight_grams", "cargo_places",
+            )
+        }
 
-    assert dict(item) == {
+    assert item_values == {
         "boxes": 5,
         "units_per_box": 10,
         "units": 50,
@@ -330,7 +330,7 @@ def test_order_persists_calculation_and_price_snapshot(
         "total_weight_grams": 54_500,
         "cargo_places": 5,
     }
-    assert dict(order) == {
+    assert order_values == {
         "total_boxes": 5,
         "total_units": 50,
         "products_amount_kopecks": 1_450_000,

@@ -12,12 +12,13 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import ipaddress
 import os
-from pathlib import Path
 import re
 from typing import Final
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 _TRUE_VALUES: Final = frozenset({"1", "true", "yes", "on"})
@@ -212,8 +213,7 @@ class Settings:
     api_docs_enabled: bool
     log_level: str
 
-    database_path: Path
-    sqlite_busy_timeout_ms: int
+    database_url: str = field(repr=False)
 
     cors_allowed_origins: tuple[str, ...]
     allowed_hosts: tuple[str, ...]
@@ -253,14 +253,6 @@ class Settings:
     def is_test(self) -> bool:
         return self.app_env == "test"
 
-    @property
-    def database_url(self) -> str:
-        """A sqlite URL for libraries that accept SQLAlchemy-style URLs."""
-
-        if str(self.database_path) == ":memory:":
-            return "sqlite:///:memory:"
-        return f"sqlite:///{self.database_path.as_posix()}"
-
     def require_hash_secret(self) -> bytes:
         """Return the HMAC key or fail before privacy-sensitive hashing is attempted."""
 
@@ -290,10 +282,27 @@ class Settings:
         if log_level not in _LOG_LEVELS:
             raise ConfigError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
 
-        database_raw = _get(source, "DATABASE_PATH", "./data/adrosta.sqlite3")
-        if not database_raw:
-            raise ConfigError("DATABASE_PATH must not be empty")
-        database_path = Path(database_raw)
+        database_url = _get(source, "DATABASE_URL")
+        if not database_url:
+            raise ConfigError("DATABASE_URL is required")
+        try:
+            parsed_database_url = make_url(database_url)
+        except ArgumentError as exc:
+            raise ConfigError("DATABASE_URL must be a valid SQLAlchemy URL") from exc
+        driver_name = parsed_database_url.drivername
+        if app_env == "test":
+            allowed_database_drivers = {
+                "postgresql+psycopg",
+                "sqlite",
+                "sqlite+pysqlite",
+            }
+        else:
+            allowed_database_drivers = {"postgresql+psycopg"}
+        if driver_name not in allowed_database_drivers:
+            expected = "postgresql+psycopg"
+            if app_env == "test":
+                expected += " or sqlite+pysqlite"
+            raise ConfigError(f"DATABASE_URL driver must be {expected}")
 
         origins = _parse_csv(source, "CORS_ALLOWED_ORIGINS")
         hosts = _parse_csv(source, "ALLOWED_HOSTS")
@@ -323,10 +332,7 @@ class Settings:
                 source, "API_DOCS_ENABLED", app_env != "production"
             ),
             log_level=log_level,
-            database_path=database_path,
-            sqlite_busy_timeout_ms=_parse_int(
-                source, "SQLITE_BUSY_TIMEOUT_MS", 5_000, maximum=120_000
-            ),
+            database_url=database_url,
             cors_allowed_origins=origins,
             allowed_hosts=hosts,
             trusted_proxy_ips=proxies,
@@ -413,8 +419,6 @@ class Settings:
             raise ConfigError("DEBUG must be false in production")
         if self.api_docs_enabled:
             raise ConfigError("API_DOCS_ENABLED must be false in production")
-        if not self.database_path.is_absolute() or str(self.database_path) == ":memory:":
-            raise ConfigError("DATABASE_PATH must be an absolute persistent path in production")
         if not self.cors_allowed_origins:
             raise ConfigError("CORS_ALLOWED_ORIGINS is required in production")
         if not self.allowed_hosts:

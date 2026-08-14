@@ -13,8 +13,8 @@ RUN addgroup --system adrosta \
     && adduser --system --ingroup adrosta --home /app adrosta
 
 COPY app ./app
-COPY data/.gitkeep ./data/.gitkeep
-RUN chown -R adrosta:adrosta /app/data
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
 
 USER adrosta
 EXPOSE 8000

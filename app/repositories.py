@@ -1,19 +1,24 @@
-"""Persistence repositories for products, orders, limits and delivery events.
+"""SQLAlchemy repositories for products, orders, limits and delivery events.
 
-Only trusted product snapshots and normalized order fields are stored.  Raw
-idempotency keys, client/IP identifiers and request fingerprints never reach
-SQLite: they are domain-separated HMAC-SHA256 digests.
+Only trusted product snapshots and normalized order fields are stored. Raw
+idempotency keys, client/IP identifiers and request fingerprints are persisted
+only as domain-separated HMAC-SHA256 digests.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+from sqlalchemy import delete, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.database import Database
 from app.domain import (
@@ -21,9 +26,18 @@ from app.domain import (
     PriceTier as DomainPriceTier,
     Product as DomainProduct,
 )
+from app.models import (
+    IdempotencyRecordModel,
+    OrderItemModel,
+    OrderModel,
+    OutboxModel,
+    ProductModel,
+    ProductPriceTierModel,
+    RateLimitWindowModel,
+)
 
 
-_SQLITE_MAX_INTEGER = 9_223_372_036_854_775_807
+_MAX_BIGINT = 9_223_372_036_854_775_807
 _PRODUCT_UPDATE_FIELDS = {
     "name",
     "units_per_box",
@@ -180,8 +194,6 @@ class OrderResponse:
     items: Tuple[OrderItemSnapshot, ...]
 
     def as_dict(self) -> dict:
-        """Return the PII-free object safe to send to the browser."""
-
         return {
             "orderId": self.order_id,
             "status": self.status,
@@ -249,8 +261,6 @@ class WebhookOrder:
     items: Tuple[OrderItemSnapshot, ...]
 
     def as_dict(self) -> dict:
-        """Reconstruct the nested contract only when dispatching a webhook."""
-
         company = None
         if any(
             value is not None
@@ -267,7 +277,6 @@ class WebhookOrder:
                 "kpp": self.company_kpp,
                 "legalAddress": self.company_legal_address,
             }
-
         delivery = {"method": self.delivery_method}
         for name, value in (
             ("type", self.delivery_type),
@@ -294,7 +303,6 @@ class WebhookOrder:
                 "phone": self.recipient_phone,
                 "email": self.recipient_email,
             }
-
         return {
             "orderId": self.order_id,
             "status": self.status,
@@ -368,8 +376,8 @@ def _required_text(value: str, field: str) -> str:
 def _positive_integer(value: int, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field} must be a positive integer")
-    if value > _SQLITE_MAX_INTEGER:
-        raise ValueError(f"{field} exceeds SQLite integer range")
+    if value > _MAX_BIGINT:
+        raise ValueError(f"{field} exceeds database bigint range")
     return value
 
 
@@ -384,24 +392,15 @@ class ProductRepository:
         units_per_box = _positive_integer(product.units_per_box, "units_per_box")
         weight = _positive_integer(product.box_weight_grams, "box_weight_grams")
         volume = _positive_integer(product.box_volume_mm3, "box_volume_mm3")
-
-        dimensions = (
-            product.box_length_mm,
-            product.box_width_mm,
-            product.box_height_mm,
-        )
+        dimensions = (product.box_length_mm, product.box_width_mm, product.box_height_mm)
         if not all(value is not None for value in dimensions):
             raise ValueError("All three positive box dimensions are required")
         for field, value in zip(
             ("box_length_mm", "box_width_mm", "box_height_mm"), dimensions
         ):
             _positive_integer(value, field)  # type: ignore[arg-type]
-        calculated_volume = dimensions[0] * dimensions[1] * dimensions[2]  # type: ignore[operator]
-        if volume != calculated_volume:
-            raise ValueError(
-                "box_volume_mm3 must equal length_mm * width_mm * height_mm"
-            )
-
+        if volume != dimensions[0] * dimensions[1] * dimensions[2]:  # type: ignore[operator]
+            raise ValueError("box_volume_mm3 must equal length_mm * width_mm * height_mm")
         if not isinstance(product.active, bool):
             raise ValueError("active must be a boolean")
         return replace(
@@ -414,105 +413,79 @@ class ProductRepository:
         )
 
     @staticmethod
-    def _from_row(row: sqlite3.Row) -> Product:
+    def _from_model(row: ProductModel) -> Product:
         return Product(
-            sku=row["sku"],
-            name=row["name"],
-            units_per_box=row["units_per_box"],
-            box_weight_grams=row["box_weight_grams"],
-            box_volume_mm3=row["box_volume_mm3"],
-            box_length_mm=row["box_length_mm"],
-            box_width_mm=row["box_width_mm"],
-            box_height_mm=row["box_height_mm"],
-            active=bool(row["active"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            sku=row.sku,
+            name=row.name,
+            units_per_box=row.units_per_box,
+            box_weight_grams=row.box_weight_grams,
+            box_volume_mm3=row.box_volume_mm3,
+            box_length_mm=row.box_length_mm,
+            box_width_mm=row.box_width_mm,
+            box_height_mm=row.box_height_mm,
+            active=row.active,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
         )
+
+    @staticmethod
+    def _values(product: Product, timestamp: int) -> dict[str, object]:
+        return {
+            "sku": product.sku,
+            "name": product.name,
+            "units_per_box": product.units_per_box,
+            "box_weight_grams": product.box_weight_grams,
+            "box_volume_mm3": product.box_volume_mm3,
+            "box_length_mm": product.box_length_mm,
+            "box_width_mm": product.box_width_mm,
+            "box_height_mm": product.box_height_mm,
+            "active": product.active,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
 
     def create(self, product: Product, *, now: Optional[int] = None) -> Product:
         product = self._validate(product)
         timestamp = _now(now)
         try:
-            with self.database.transaction() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO products (
-                        sku, name, units_per_box, box_weight_grams, box_volume_mm3,
-                        box_length_mm, box_width_mm, box_height_mm,
-                        active, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        product.sku,
-                        product.name,
-                        product.units_per_box,
-                        product.box_weight_grams,
-                        product.box_volume_mm3,
-                        product.box_length_mm,
-                        product.box_width_mm,
-                        product.box_height_mm,
-                        int(product.active),
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-        except sqlite3.IntegrityError as exc:
-            if "products.sku" in str(exc):
-                raise ProductAlreadyExistsError(product.sku) from exc
-            raise
-        created = self.get(product.sku, active_only=False)
-        assert created is not None
-        return created
+            with self.database.transaction() as session:
+                row = ProductModel(**self._values(product, timestamp))
+                session.add(row)
+                session.flush()
+        except IntegrityError as exc:
+            raise ProductAlreadyExistsError(product.sku) from exc
+        return self._from_model(row)
 
     def upsert(self, product: Product, *, now: Optional[int] = None) -> Product:
         product = self._validate(product)
         timestamp = _now(now)
-        with self.database.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO products (
-                    sku, name, units_per_box, box_weight_grams, box_volume_mm3,
-                    box_length_mm, box_width_mm, box_height_mm,
-                    active, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sku) DO UPDATE SET
-                    name = excluded.name,
-                    units_per_box = excluded.units_per_box,
-                    box_weight_grams = excluded.box_weight_grams,
-                    box_volume_mm3 = excluded.box_volume_mm3,
-                    box_length_mm = excluded.box_length_mm,
-                    box_width_mm = excluded.box_width_mm,
-                    box_height_mm = excluded.box_height_mm,
-                    active = excluded.active,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    product.sku,
-                    product.name,
-                    product.units_per_box,
-                    product.box_weight_grams,
-                    product.box_volume_mm3,
-                    product.box_length_mm,
-                    product.box_width_mm,
-                    product.box_height_mm,
-                    int(product.active),
-                    timestamp,
-                    timestamp,
-                ),
+        values = self._values(product, timestamp)
+        with self.database.transaction() as session:
+            if self.database.is_postgresql:
+                statement = postgresql_insert(ProductModel).values(**values)
+            else:
+                statement = sqlite_insert(ProductModel).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=["sku"],
+                set_={
+                    name: value
+                    for name, value in values.items()
+                    if name not in {"sku", "created_at"}
+                },
             )
-        saved = self.get(product.sku, active_only=False)
-        assert saved is not None
-        return saved
+            session.execute(statement)
+            row = session.get(ProductModel, product.sku)
+            assert row is not None
+        return self._from_model(row)
 
     def get(self, sku: str, *, active_only: bool = True) -> Optional[Product]:
         sku = _required_text(sku, "sku")
-        query = "SELECT * FROM products WHERE sku = ?"
-        parameters: List[object] = [sku]
+        statement = select(ProductModel).where(ProductModel.sku == sku)
         if active_only:
-            query += " AND active = 1"
-        with self.database.connection() as connection:
-            row = connection.execute(query, parameters).fetchone()
-        return self._from_row(row) if row is not None else None
+            statement = statement.where(ProductModel.active.is_(True))
+        with self.database.session() as session:
+            row = session.scalar(statement)
+            return self._from_model(row) if row is not None else None
 
     fetch = get
 
@@ -522,43 +495,31 @@ class ProductRepository:
         cleaned = list(dict.fromkeys(_required_text(sku, "sku") for sku in skus))
         if not cleaned:
             return {}
-
-        found: Dict[str, Product] = {}
-        with self.database.connection() as connection:
-            for offset in range(0, len(cleaned), 500):
-                chunk = cleaned[offset : offset + 500]
-                placeholders = ",".join("?" for _ in chunk)
-                query = f"SELECT * FROM products WHERE sku IN ({placeholders})"
-                if active_only:
-                    query += " AND active = 1"
-                for row in connection.execute(query, chunk).fetchall():
-                    product = self._from_row(row)
-                    found[product.sku] = product
-        return found
+        statement = select(ProductModel).where(ProductModel.sku.in_(cleaned))
+        if active_only:
+            statement = statement.where(ProductModel.active.is_(True))
+        with self.database.session() as session:
+            rows = session.scalars(statement).all()
+            return {row.sku: self._from_model(row) for row in rows}
 
     def list(
-        self,
-        *,
-        active_only: bool = True,
-        limit: int = 1_000,
-        offset: int = 0,
+        self, *, active_only: bool = True, limit: int = 1_000, offset: int = 0
     ) -> List[Product]:
         if limit <= 0 or limit > 10_000 or offset < 0:
             raise ValueError("Invalid pagination")
-        query = "SELECT * FROM products"
+        statement = select(ProductModel)
         if active_only:
-            query += " WHERE active = 1"
-        query += " ORDER BY sku LIMIT ? OFFSET ?"
-        with self.database.connection() as connection:
-            rows = connection.execute(query, (limit, offset)).fetchall()
-        return [self._from_row(row) for row in rows]
+            statement = statement.where(ProductModel.active.is_(True))
+        statement = statement.order_by(ProductModel.sku).limit(limit).offset(offset)
+        with self.database.session() as session:
+            return [self._from_model(row) for row in session.scalars(statement)]
 
     def count(self, *, active_only: bool = True) -> int:
-        query = "SELECT COUNT(*) FROM products"
+        statement = select(func.count()).select_from(ProductModel)
         if active_only:
-            query += " WHERE active = 1"
-        with self.database.connection() as connection:
-            return int(connection.execute(query).fetchone()[0])
+            statement = statement.where(ProductModel.active.is_(True))
+        with self.database.session() as session:
+            return int(session.scalar(statement) or 0)
 
     def update(
         self, sku: str, *, now: Optional[int] = None, **changes: object
@@ -567,52 +528,29 @@ class ProductRepository:
         unknown_fields = set(changes) - _PRODUCT_UPDATE_FIELDS
         if unknown_fields:
             raise ValueError("Unsupported product fields: " + ", ".join(unknown_fields))
-        current = self.get(sku, active_only=False)
-        if current is None:
-            raise ProductNotFoundError(sku)
-        if not changes:
-            return current
-
-        candidate = self._validate(replace(current, **changes))
-        timestamp = _now(now)
-        with self.database.transaction() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE products SET
-                    name = ?, units_per_box = ?, box_weight_grams = ?, box_volume_mm3 = ?,
-                    box_length_mm = ?, box_width_mm = ?, box_height_mm = ?,
-                    active = ?, updated_at = ?
-                WHERE sku = ?
-                """,
-                (
-                    candidate.name,
-                    candidate.units_per_box,
-                    candidate.box_weight_grams,
-                    candidate.box_volume_mm3,
-                    candidate.box_length_mm,
-                    candidate.box_width_mm,
-                    candidate.box_height_mm,
-                    int(candidate.active),
-                    timestamp,
-                    sku,
-                ),
-            )
-            if cursor.rowcount != 1:
+        with self.database.transaction() as session:
+            statement = select(ProductModel).where(ProductModel.sku == sku).with_for_update()
+            row = session.scalar(statement)
+            if row is None:
                 raise ProductNotFoundError(sku)
-        updated = self.get(sku, active_only=False)
-        assert updated is not None
-        return updated
+            current = self._from_model(row)
+            if not changes:
+                return current
+            candidate = self._validate(replace(current, **changes))
+            for name in _PRODUCT_UPDATE_FIELDS:
+                setattr(row, name, getattr(candidate, name))
+            row.updated_at = _now(now)
+            session.flush()
+            return self._from_model(row)
 
-    def set_active(
-        self, sku: str, active: bool, *, now: Optional[int] = None
-    ) -> Product:
+    def set_active(self, sku: str, active: bool, *, now: Optional[int] = None) -> Product:
         return self.update(sku, active=active, now=now)
 
     def delete(self, sku: str) -> bool:
         sku = _required_text(sku, "sku")
-        with self.database.transaction() as connection:
-            cursor = connection.execute("DELETE FROM products WHERE sku = ?", (sku,))
-            return cursor.rowcount == 1
+        with self.database.transaction() as session:
+            result = session.execute(delete(ProductModel).where(ProductModel.sku == sku))
+            return result.rowcount == 1
 
     def replace_price_tiers(
         self,
@@ -621,98 +559,75 @@ class ProductRepository:
         *,
         now: Optional[int] = None,
     ) -> tuple[ProductPriceTier, ...]:
-        """Atomically replace persisted tiers without applying pricing rules."""
-
         sku = _required_text(sku, "sku")
         normalized = tuple(tiers)
         if any(not isinstance(tier, DomainPriceTier) for tier in normalized):
             raise ValueError("tiers must contain ProductPriceTier values")
         timestamp = _now(now)
-        with self.database.transaction() as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM products WHERE sku = ?", (sku,)
-            ).fetchone()
-            if exists is None:
-                raise ProductNotFoundError(sku)
-            connection.execute(
-                "DELETE FROM product_price_tiers WHERE product_sku = ?", (sku,)
+        with self.database.transaction() as session:
+            product = session.scalar(
+                select(ProductModel).where(ProductModel.sku == sku).with_for_update()
             )
-            connection.executemany(
-                """
-                INSERT INTO product_price_tiers (
-                    product_sku, min_boxes, max_boxes,
-                    price_per_unit_kopecks, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    (
-                        sku,
-                        tier.min_boxes,
-                        tier.max_boxes,
-                        tier.price_per_unit_kopecks,
-                        timestamp,
-                        timestamp,
-                    )
-                    for tier in normalized
-                ),
+            if product is None:
+                raise ProductNotFoundError(sku)
+            session.execute(
+                delete(ProductPriceTierModel).where(
+                    ProductPriceTierModel.product_sku == sku
+                )
+            )
+            session.add_all(
+                ProductPriceTierModel(
+                    product_sku=sku,
+                    min_boxes=tier.min_boxes,
+                    max_boxes=tier.max_boxes,
+                    price_per_unit_kopecks=tier.price_per_unit_kopecks,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+                for tier in normalized
             )
         return normalized
 
     def fetch_catalog(self, skus: Iterable[str]) -> Dict[str, DomainProduct]:
-        """Load canonical products and all their SKU-specific price tiers."""
-
         cleaned = list(dict.fromkeys(_required_text(sku, "sku") for sku in skus))
         if not cleaned:
             return {}
-
-        rows_by_sku: Dict[str, sqlite3.Row] = {}
-        tiers_by_sku: Dict[str, list[DomainPriceTier]] = {
-            sku: [] for sku in cleaned
-        }
-        with self.database.connection() as connection:
-            for offset in range(0, len(cleaned), 500):
-                chunk = cleaned[offset : offset + 500]
-                placeholders = ",".join("?" for _ in chunk)
-                product_rows = connection.execute(
-                    f"SELECT * FROM products "
-                    f"WHERE active = 1 AND sku IN ({placeholders})",
-                    chunk,
-                ).fetchall()
-                for row in product_rows:
-                    rows_by_sku[row["sku"]] = row
-                tier_rows = connection.execute(
-                    f"""
-                    SELECT product_sku, min_boxes, max_boxes,
-                           price_per_unit_kopecks
-                    FROM product_price_tiers
-                    WHERE product_sku IN ({placeholders})
-                    ORDER BY product_sku, min_boxes, max_boxes
-                    """,
-                    chunk,
-                ).fetchall()
-                for row in tier_rows:
-                    tiers_by_sku[row["product_sku"]].append(
-                        DomainPriceTier(
-                            min_boxes=row["min_boxes"],
-                            max_boxes=row["max_boxes"],
-                            price_per_unit_kopecks=row[
-                                "price_per_unit_kopecks"
-                            ],
-                        )
-                    )
-
-        return {
-            sku: DomainProduct(
-                sku=sku,
-                name=row["name"],
-                units_per_box=row["units_per_box"],
-                weight_grams=row["box_weight_grams"],
-                length_mm=row["box_length_mm"],
-                width_mm=row["box_width_mm"],
-                height_mm=row["box_height_mm"],
-                price_tiers=tuple(tiers_by_sku[sku]),
+        with self.database.session() as session:
+            products = session.scalars(
+                select(ProductModel).where(
+                    ProductModel.active.is_(True), ProductModel.sku.in_(cleaned)
+                )
+            ).all()
+            tiers = session.scalars(
+                select(ProductPriceTierModel)
+                .where(ProductPriceTierModel.product_sku.in_(cleaned))
+                .order_by(
+                    ProductPriceTierModel.product_sku,
+                    ProductPriceTierModel.min_boxes,
+                    ProductPriceTierModel.max_boxes,
+                )
+            ).all()
+        tiers_by_sku: Dict[str, list[DomainPriceTier]] = {sku: [] for sku in cleaned}
+        for tier in tiers:
+            tiers_by_sku[tier.product_sku].append(
+                DomainPriceTier(
+                    min_boxes=tier.min_boxes,
+                    max_boxes=tier.max_boxes,
+                    price_per_unit_kopecks=tier.price_per_unit_kopecks,
+                )
             )
-            for sku, row in rows_by_sku.items()
+        return {
+            row.sku: DomainProduct(
+                sku=row.sku,
+                name=row.name,
+                units_per_box=row.units_per_box,
+                weight_grams=row.box_weight_grams,
+                length_mm=row.box_length_mm,
+                width_mm=row.box_width_mm,
+                height_mm=row.box_height_mm,
+                price_tiers=tuple(tiers_by_sku[row.sku]),
+            )
+            for row in products
         }
 
 
@@ -742,33 +657,31 @@ class RateLimitRepository:
         window_start = timestamp - (timestamp % window_seconds)
         reset_at = window_start + window_seconds
         subject_digest = _digest(self._secret, f"rate-limit:{scope}", subject)
-
-        with self.database.transaction() as connection:
-            connection.execute(
-                "DELETE FROM rate_limit_windows WHERE window_start < ?",
-                (window_start - window_seconds,),
+        values = {
+            "scope": scope,
+            "subject_digest": subject_digest,
+            "window_start": window_start,
+            "request_count": cost,
+            "updated_at": timestamp,
+        }
+        with self.database.transaction() as session:
+            session.execute(
+                delete(RateLimitWindowModel).where(
+                    RateLimitWindowModel.window_start < window_start - window_seconds
+                )
             )
-            connection.execute(
-                """
-                INSERT INTO rate_limit_windows (
-                    scope, subject_digest, window_start, request_count, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(scope, subject_digest, window_start) DO UPDATE SET
-                    request_count = request_count + excluded.request_count,
-                    updated_at = excluded.updated_at
-                """,
-                (scope, subject_digest, window_start, cost, timestamp),
-            )
-            count = int(
-                connection.execute(
-                    """
-                    SELECT request_count FROM rate_limit_windows
-                    WHERE scope = ? AND subject_digest = ? AND window_start = ?
-                    """,
-                    (scope, subject_digest, window_start),
-                ).fetchone()[0]
-            )
-
+            if self.database.is_postgresql:
+                statement = postgresql_insert(RateLimitWindowModel).values(**values)
+            else:
+                statement = sqlite_insert(RateLimitWindowModel).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=["scope", "subject_digest", "window_start"],
+                set_={
+                    "request_count": RateLimitWindowModel.request_count + cost,
+                    "updated_at": timestamp,
+                },
+            ).returning(RateLimitWindowModel.request_count)
+            count = int(session.scalar(statement))
         allowed = count <= limit
         return RateLimitResult(
             allowed=allowed,
@@ -780,15 +693,17 @@ class RateLimitRepository:
         )
 
     def prune(self, *, before: int) -> int:
-        with self.database.transaction() as connection:
-            cursor = connection.execute(
-                "DELETE FROM rate_limit_windows WHERE window_start < ?", (int(before),)
+        with self.database.transaction() as session:
+            result = session.execute(
+                delete(RateLimitWindowModel).where(
+                    RateLimitWindowModel.window_start < int(before)
+                )
             )
-            return cursor.rowcount
+            return result.rowcount
 
 
 class OrderRepository:
-    """Creates orders, trusted item snapshots and outbox events atomically."""
+    """Create orders, trusted item snapshots and outbox events atomically."""
 
     def __init__(
         self,
@@ -877,9 +792,7 @@ class OrderRepository:
                         draft.delivery_apartment,
                     )
                 ):
-                    raise InvalidOrderError(
-                        "CDEK pickup must not contain door address fields"
-                    )
+                    raise InvalidOrderError("CDEK pickup must not contain door address fields")
             else:
                 for field in ("delivery_street", "delivery_house"):
                     try:
@@ -893,72 +806,68 @@ class OrderRepository:
         return OrderRepository._validated_items(draft.items)
 
     @staticmethod
-    def _items_for_order(
-        connection: sqlite3.Connection, order_id: str
-    ) -> Tuple[OrderItemSnapshot, ...]:
-        rows = connection.execute(
-            """
-            SELECT * FROM order_items
-            WHERE order_id = ? ORDER BY line_number
-            """,
-            (order_id,),
-        ).fetchall()
+    def _items_for_order(session: Session, order_id: str) -> Tuple[OrderItemSnapshot, ...]:
+        rows = session.scalars(
+            select(OrderItemModel)
+            .where(OrderItemModel.order_id == order_id)
+            .order_by(OrderItemModel.line_number)
+        ).all()
         return tuple(
             OrderItemSnapshot(
-                sku=row["sku"],
-                product_name=row["product_name"],
-                boxes=row["boxes"],
-                units_per_box=row["units_per_box"],
-                units=row["units"],
-                price_per_unit_kopecks=row["price_per_unit_kopecks"],
-                price_per_box_kopecks=row["price_per_box_kopecks"],
-                line_amount_kopecks=row["line_amount_kopecks"],
-                unit_weight_grams=row["unit_weight_grams"],
-                unit_volume_mm3=row["unit_volume_mm3"],
-                box_length_mm=row["box_length_mm"],
-                box_width_mm=row["box_width_mm"],
-                box_height_mm=row["box_height_mm"],
-                total_weight_grams=row["total_weight_grams"],
-                total_volume_mm3=row["total_volume_mm3"],
-                cargo_places=row["cargo_places"],
+                sku=row.sku,
+                product_name=row.product_name,
+                boxes=row.boxes,
+                units_per_box=row.units_per_box,
+                units=row.units,
+                price_per_unit_kopecks=row.price_per_unit_kopecks,
+                price_per_box_kopecks=row.price_per_box_kopecks,
+                line_amount_kopecks=row.line_amount_kopecks,
+                unit_weight_grams=row.unit_weight_grams,
+                unit_volume_mm3=row.unit_volume_mm3,
+                box_length_mm=row.box_length_mm,
+                box_width_mm=row.box_width_mm,
+                box_height_mm=row.box_height_mm,
+                total_weight_grams=row.total_weight_grams,
+                total_volume_mm3=row.total_volume_mm3,
+                cargo_places=row.cargo_places,
             )
             for row in rows
         )
 
     @classmethod
     def _response_for_order(
-        cls, connection: sqlite3.Connection, order_id: str
+        cls, session: Session, order_id: str
     ) -> Optional[OrderResponse]:
-        row = connection.execute(
-            """
-            SELECT id, status, created_at, total_boxes, total_units,
-                   products_amount_kopecks, total_weight_grams,
-                   total_volume_mm3, cargo_places
-            FROM orders WHERE id = ?
-            """,
-            (order_id,),
-        ).fetchone()
+        row = session.get(OrderModel, order_id)
         if row is None:
             return None
         return OrderResponse(
-            order_id=row["id"],
-            status=row["status"],
-            created_at=row["created_at"],
-            total_boxes=row["total_boxes"],
-            total_units=row["total_units"],
-            products_amount_kopecks=row["products_amount_kopecks"],
-            total_weight_grams=row["total_weight_grams"],
-            total_volume_mm3=row["total_volume_mm3"],
-            cargo_places=row["cargo_places"],
-            items=cls._items_for_order(connection, order_id),
+            order_id=row.id,
+            status=row.status,
+            created_at=row.created_at,
+            total_boxes=row.total_boxes,
+            total_units=row.total_units,
+            products_amount_kopecks=row.products_amount_kopecks,
+            total_weight_grams=row.total_weight_grams,
+            total_volume_mm3=row.total_volume_mm3,
+            cargo_places=row.cargo_places,
+            items=cls._items_for_order(session, order_id),
         )
 
+    @staticmethod
+    def _advisory_lock_id(digest: str) -> int:
+        value = int(digest[:16], 16)
+        return value - (1 << 64) if value >= (1 << 63) else value
+
+    def _lock_digest(self, session: Session, digest: str) -> None:
+        if self.database.is_postgresql:
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": self._advisory_lock_id(digest)},
+            )
+
     def lookup_idempotency(
-        self,
-        *,
-        idempotency_key: str,
-        request_hash: str,
-        now: Optional[int] = None,
+        self, *, idempotency_key: str, request_hash: str, now: Optional[int] = None
     ) -> Optional[OrderResponse]:
         clean_key = _required_text(idempotency_key, "idempotency_key")
         clean_request_hash = _required_text(request_hash, "request_hash")
@@ -966,30 +875,21 @@ class OrderRepository:
             raise InvalidOrderError("idempotency_key is too long")
         timestamp = _now(now)
         key_digest = _digest(self._secret, "idempotency-key", clean_key)
-        request_digest = _digest(
-            self._secret,
-            "idempotency-request",
-            clean_request_hash,
-        )
-        with self.database.transaction() as connection:
-            connection.execute(
-                "DELETE FROM idempotency_records WHERE expires_at <= ?",
-                (timestamp,),
+        request_digest = _digest(self._secret, "idempotency-request", clean_request_hash)
+        with self.database.transaction() as session:
+            session.execute(
+                delete(IdempotencyRecordModel).where(
+                    IdempotencyRecordModel.expires_at <= timestamp
+                )
             )
-            existing = connection.execute(
-                """
-                SELECT request_digest, order_id FROM idempotency_records
-                WHERE key_digest = ?
-                """,
-                (key_digest,),
-            ).fetchone()
+            existing = session.get(IdempotencyRecordModel, key_digest)
             if existing is None:
                 return None
-            if not hmac.compare_digest(existing["request_digest"], request_digest):
+            if not hmac.compare_digest(existing.request_digest, request_digest):
                 raise IdempotencyConflictError(
                     "Idempotency key was already used for another request"
                 )
-            response = self._response_for_order(connection, existing["order_id"])
+            response = self._response_for_order(session, existing.order_id)
             if response is None:
                 raise RepositoryError("Idempotency record references no order")
             return response
@@ -1043,7 +943,6 @@ class OrderRepository:
             event_type = _required_text(outbox_event_type, "outbox_event_type")
         except ValueError as exc:
             raise InvalidOrderError(str(exc)) from exc
-
         timestamp = _now(now)
         request_digest = _digest(self._secret, "idempotency-request", request_hash)
         fingerprint_digest = _digest(
@@ -1059,169 +958,131 @@ class OrderRepository:
                 raise InvalidOrderError("idempotency_key is too long")
             key_digest = _digest(self._secret, "idempotency-key", clean_key)
 
-        with self.database.transaction() as connection:
-            connection.execute(
-                "DELETE FROM idempotency_records WHERE expires_at <= ?", (timestamp,)
+        with self.database.transaction() as session:
+            session.execute(
+                delete(IdempotencyRecordModel).where(
+                    IdempotencyRecordModel.expires_at <= timestamp
+                )
             )
-
             if key_digest is not None:
-                existing = connection.execute(
-                    """
-                    SELECT request_digest, order_id FROM idempotency_records
-                    WHERE key_digest = ?
-                    """,
-                    (key_digest,),
-                ).fetchone()
+                self._lock_digest(session, key_digest)
+                existing = session.get(IdempotencyRecordModel, key_digest)
                 if existing is not None:
-                    if not hmac.compare_digest(existing["request_digest"], request_digest):
+                    if not hmac.compare_digest(existing.request_digest, request_digest):
                         raise IdempotencyConflictError(
                             "Idempotency key was already used for another request"
                         )
-                    response = self._response_for_order(
-                        connection, existing["order_id"]
-                    )
+                    response = self._response_for_order(session, existing.order_id)
                     if response is None:
                         raise RepositoryError("Idempotency record references no order")
-                    return CreateOrderResult(
-                        response=response,
-                        created=False,
-                        replayed=True,
-                        duplicate=False,
-                    )
+                    return CreateOrderResult(response, False, True, False)
 
-            duplicate = connection.execute(
-                """
-                SELECT id FROM orders
-                WHERE request_fingerprint_digest = ? AND created_at >= ?
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (fingerprint_digest, timestamp - self.duplicate_window_seconds),
-            ).fetchone()
-            if duplicate is not None:
-                response = self._response_for_order(connection, duplicate["id"])
+            self._lock_digest(session, fingerprint_digest)
+            duplicate_id = session.scalar(
+                select(OrderModel.id)
+                .where(
+                    OrderModel.request_fingerprint_digest == fingerprint_digest,
+                    OrderModel.created_at >= timestamp - self.duplicate_window_seconds,
+                )
+                .order_by(OrderModel.created_at.desc())
+                .limit(1)
+            )
+            if duplicate_id is not None:
+                response = self._response_for_order(session, duplicate_id)
                 if response is None:
                     raise RepositoryError("Duplicate query returned no order")
-                return CreateOrderResult(
-                    response=response,
-                    created=False,
-                    replayed=False,
-                    duplicate=True,
-                )
+                return CreateOrderResult(response, False, False, True)
 
             order_id = str(uuid.uuid4())
-            connection.execute(
-                """
-                INSERT INTO orders (
-                    id, status, buyer_type, buyer_contact_name, buyer_phone,
-                    buyer_email, company_name, company_inn, company_kpp,
-                    company_legal_address, delivery_method, delivery_type,
-                    delivery_region, delivery_city, delivery_office_code,
-                    delivery_postcode, delivery_street, delivery_house,
-                    delivery_apartment, recipient_contact_name, recipient_phone,
-                    recipient_email, comment, total_boxes, total_units,
-                    products_amount_kopecks, total_weight_grams,
-                    total_volume_mm3, cargo_places,
-                    request_fingerprint_digest, created_at, updated_at
-                ) VALUES (
-                    ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            session.add(
+                OrderModel(
+                    id=order_id,
+                    status="accepted",
+                    buyer_type=draft.buyer_type.strip(),
+                    buyer_contact_name=draft.buyer_contact_name.strip(),
+                    buyer_phone=draft.buyer_phone.strip(),
+                    buyer_email=draft.buyer_email.strip(),
+                    company_name=draft.company_name,
+                    company_inn=draft.company_inn,
+                    company_kpp=draft.company_kpp,
+                    company_legal_address=draft.company_legal_address,
+                    delivery_method=draft.delivery_method.strip(),
+                    delivery_type=draft.delivery_type,
+                    delivery_region=draft.delivery_region,
+                    delivery_city=draft.delivery_city,
+                    delivery_office_code=draft.delivery_office_code,
+                    delivery_postcode=draft.delivery_postcode,
+                    delivery_street=draft.delivery_street,
+                    delivery_house=draft.delivery_house,
+                    delivery_apartment=draft.delivery_apartment,
+                    recipient_contact_name=draft.recipient_contact_name,
+                    recipient_phone=draft.recipient_phone,
+                    recipient_email=draft.recipient_email,
+                    comment=draft.comment,
+                    total_boxes=totals.total_boxes,
+                    total_units=totals.total_units,
+                    products_amount_kopecks=totals.products_amount_kopecks,
+                    total_weight_grams=totals.total_weight_grams,
+                    total_volume_mm3=totals.total_volume_mm3,
+                    cargo_places=totals.cargo_places,
+                    request_fingerprint_digest=fingerprint_digest,
+                    created_at=timestamp,
+                    updated_at=timestamp,
                 )
-                """,
-                (
-                    order_id,
-                    draft.buyer_type.strip(),
-                    draft.buyer_contact_name.strip(),
-                    draft.buyer_phone.strip(),
-                    draft.buyer_email.strip(),
-                    draft.company_name,
-                    draft.company_inn,
-                    draft.company_kpp,
-                    draft.company_legal_address,
-                    draft.delivery_method.strip(),
-                    draft.delivery_type,
-                    draft.delivery_region,
-                    draft.delivery_city,
-                    draft.delivery_office_code,
-                    draft.delivery_postcode,
-                    draft.delivery_street,
-                    draft.delivery_house,
-                    draft.delivery_apartment,
-                    draft.recipient_contact_name,
-                    draft.recipient_phone,
-                    draft.recipient_email,
-                    draft.comment,
-                    totals.total_boxes,
-                    totals.total_units,
-                    totals.products_amount_kopecks,
-                    totals.total_weight_grams,
-                    totals.total_volume_mm3,
-                    totals.cargo_places,
-                    fingerprint_digest,
-                    timestamp,
-                    timestamp,
-                ),
             )
-
-            for line_number, snapshot in enumerate(snapshots, start=1):
-                connection.execute(
-                    """
-                    INSERT INTO order_items (
-                        order_id, line_number, sku, product_name, boxes,
-                        units_per_box, units, price_per_unit_kopecks,
-                        price_per_box_kopecks, line_amount_kopecks,
-                        unit_weight_grams, unit_volume_mm3,
-                        box_length_mm, box_width_mm, box_height_mm,
-                        total_weight_grams, total_volume_mm3, cargo_places
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        order_id,
-                        line_number,
-                        snapshot.sku,
-                        snapshot.product_name,
-                        snapshot.boxes,
-                        snapshot.units_per_box,
-                        snapshot.units,
-                        snapshot.price_per_unit_kopecks,
-                        snapshot.price_per_box_kopecks,
-                        snapshot.line_amount_kopecks,
-                        snapshot.unit_weight_grams,
-                        snapshot.unit_volume_mm3,
-                        snapshot.box_length_mm,
-                        snapshot.box_width_mm,
-                        snapshot.box_height_mm,
-                        snapshot.total_weight_grams,
-                        snapshot.total_volume_mm3,
-                        snapshot.cargo_places,
-                    ),
+            # No ORM relationships are needed by the repository, so flush the
+            # parent explicitly before inserting FK-dependent snapshots/events.
+            session.flush()
+            session.add_all(
+                OrderItemModel(
+                    order_id=order_id,
+                    line_number=line_number,
+                    sku=snapshot.sku,
+                    product_name=snapshot.product_name,
+                    boxes=snapshot.boxes,
+                    units_per_box=snapshot.units_per_box,
+                    units=snapshot.units,
+                    price_per_unit_kopecks=snapshot.price_per_unit_kopecks,
+                    price_per_box_kopecks=snapshot.price_per_box_kopecks,
+                    line_amount_kopecks=snapshot.line_amount_kopecks,
+                    unit_weight_grams=snapshot.unit_weight_grams,
+                    unit_volume_mm3=snapshot.unit_volume_mm3,
+                    box_length_mm=snapshot.box_length_mm,
+                    box_width_mm=snapshot.box_width_mm,
+                    box_height_mm=snapshot.box_height_mm,
+                    total_weight_grams=snapshot.total_weight_grams,
+                    total_volume_mm3=snapshot.total_volume_mm3,
+                    cargo_places=snapshot.cargo_places,
                 )
-
+                for line_number, snapshot in enumerate(snapshots, start=1)
+            )
             if enqueue_outbox:
-                connection.execute(
-                    """
-                    INSERT INTO outbox (
-                        event_type, order_id, status, attempt_count, available_at,
-                        created_at, updated_at
-                    ) VALUES (?, ?, 'pending', 0, ?, ?, ?)
-                    """,
-                    (event_type, order_id, timestamp, timestamp, timestamp),
+                session.add(
+                    OutboxModel(
+                        event_type=event_type,
+                        order_id=order_id,
+                        status="pending",
+                        attempt_count=0,
+                        available_at=timestamp,
+                        locked_until=None,
+                        lock_token=None,
+                        last_error=None,
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                        succeeded_at=None,
+                    )
                 )
             if key_digest is not None:
-                connection.execute(
-                    """
-                    INSERT INTO idempotency_records (
-                        key_digest, request_digest, order_id, created_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        key_digest,
-                        request_digest,
-                        order_id,
-                        timestamp,
-                        timestamp + self.idempotency_ttl_seconds,
-                    ),
+                session.add(
+                    IdempotencyRecordModel(
+                        key_digest=key_digest,
+                        request_digest=request_digest,
+                        order_id=order_id,
+                        created_at=timestamp,
+                        expires_at=timestamp + self.idempotency_ttl_seconds,
+                    )
                 )
-
+            session.flush()
             response = OrderResponse(
                 order_id=order_id,
                 status="accepted",
@@ -1234,87 +1095,78 @@ class OrderRepository:
                 cargo_places=totals.cargo_places,
                 items=snapshots,
             )
-            return CreateOrderResult(
-                response=response,
-                created=True,
-                replayed=False,
-                duplicate=False,
-            )
+            return CreateOrderResult(response, True, False, False)
 
     def get_order_response(self, order_id: str) -> Optional[OrderResponse]:
         order_id = _required_text(order_id, "order_id")
-        with self.database.connection() as connection:
-            return self._response_for_order(connection, order_id)
+        with self.database.session() as session:
+            return self._response_for_order(session, order_id)
 
     def get_order_for_webhook(self, order_id: str) -> Optional[WebhookOrder]:
         order_id = _required_text(order_id, "order_id")
-        with self.database.connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM orders WHERE id = ?", (order_id,)
-            ).fetchone()
+        with self.database.session() as session:
+            row = session.get(OrderModel, order_id)
             if row is None:
                 return None
             return WebhookOrder(
-                order_id=row["id"],
-                status=row["status"],
-                created_at=row["created_at"],
-                buyer_type=row["buyer_type"],
-                buyer_contact_name=row["buyer_contact_name"],
-                buyer_phone=row["buyer_phone"],
-                buyer_email=row["buyer_email"],
-                company_name=row["company_name"],
-                company_inn=row["company_inn"],
-                company_kpp=row["company_kpp"],
-                company_legal_address=row["company_legal_address"],
-                delivery_method=row["delivery_method"],
-                delivery_type=row["delivery_type"],
-                delivery_region=row["delivery_region"],
-                delivery_city=row["delivery_city"],
-                delivery_office_code=row["delivery_office_code"],
-                delivery_postcode=row["delivery_postcode"],
-                delivery_street=row["delivery_street"],
-                delivery_house=row["delivery_house"],
-                delivery_apartment=row["delivery_apartment"],
-                recipient_contact_name=row["recipient_contact_name"],
-                recipient_phone=row["recipient_phone"],
-                recipient_email=row["recipient_email"],
-                comment=row["comment"],
-                total_boxes=row["total_boxes"],
-                total_units=row["total_units"],
-                products_amount_kopecks=row["products_amount_kopecks"],
-                total_weight_grams=row["total_weight_grams"],
-                total_volume_mm3=row["total_volume_mm3"],
-                cargo_places=row["cargo_places"],
-                items=self._items_for_order(connection, order_id),
+                order_id=row.id,
+                status=row.status,
+                created_at=row.created_at,
+                buyer_type=row.buyer_type,
+                buyer_contact_name=row.buyer_contact_name,
+                buyer_phone=row.buyer_phone,
+                buyer_email=row.buyer_email,
+                company_name=row.company_name,
+                company_inn=row.company_inn,
+                company_kpp=row.company_kpp,
+                company_legal_address=row.company_legal_address,
+                delivery_method=row.delivery_method,
+                delivery_type=row.delivery_type,
+                delivery_region=row.delivery_region,
+                delivery_city=row.delivery_city,
+                delivery_office_code=row.delivery_office_code,
+                delivery_postcode=row.delivery_postcode,
+                delivery_street=row.delivery_street,
+                delivery_house=row.delivery_house,
+                delivery_apartment=row.delivery_apartment,
+                recipient_contact_name=row.recipient_contact_name,
+                recipient_phone=row.recipient_phone,
+                recipient_email=row.recipient_email,
+                comment=row.comment,
+                total_boxes=row.total_boxes,
+                total_units=row.total_units,
+                products_amount_kopecks=row.products_amount_kopecks,
+                total_weight_grams=row.total_weight_grams,
+                total_volume_mm3=row.total_volume_mm3,
+                cargo_places=row.cargo_places,
+                items=self._items_for_order(session, order_id),
             )
 
 
 class OutboxRepository:
-    """Lease-based durable outbox suitable for multiple dispatcher workers."""
+    """Durable outbox using row locks with SKIP LOCKED on PostgreSQL."""
 
     def __init__(self, database: Database) -> None:
         self.database = database
 
     @staticmethod
-    def _from_row(row: sqlite3.Row) -> OutboxMessage:
+    def _from_model(row: OutboxModel) -> OutboxMessage:
         return OutboxMessage(
-            id=row["id"],
-            event_type=row["event_type"],
-            order_id=row["order_id"],
-            status=row["status"],
-            attempt_count=row["attempt_count"],
-            available_at=row["available_at"],
-            locked_until=row["locked_until"],
-            lock_token=row["lock_token"],
-            created_at=row["created_at"],
+            id=row.id,
+            event_type=row.event_type,
+            order_id=row.order_id,
+            status=row.status,
+            attempt_count=row.attempt_count,
+            available_at=row.available_at,
+            locked_until=row.locked_until,
+            lock_token=row.lock_token,
+            created_at=row.created_at,
         )
 
     @staticmethod
     def _safe_error(error: object) -> str:
-        # External error strings can be very large or contain control characters.
-        # Dispatchers should pass a non-PII summary; this is a final storage guard.
-        text = str(error).replace("\r", " ").replace("\n", " ").replace("\x00", " ")
-        return text[:1_000]
+        value = str(error).replace("\r", " ").replace("\n", " ").replace("\x00", " ")
+        return value[:1_000]
 
     def claim(
         self,
@@ -1330,72 +1182,63 @@ class OutboxRepository:
         if limit > 1_000:
             raise ValueError("limit must not exceed 1000")
         timestamp = _now(now)
-
         claimed: List[OutboxMessage] = []
-        with self.database.transaction() as connection:
-            connection.execute(
-                """
-                UPDATE outbox SET
-                    status = 'failed',
-                    locked_until = NULL,
-                    lock_token = NULL,
-                    last_error = 'Maximum delivery attempts exceeded',
-                    updated_at = ?
-                WHERE attempt_count >= ? AND (
-                    (status = 'pending' AND available_at <= ?)
-                    OR (status = 'processing' AND locked_until <= ?)
+        available = or_(
+            (OutboxModel.status == "pending") & (OutboxModel.available_at <= timestamp),
+            (OutboxModel.status == "processing")
+            & (OutboxModel.locked_until <= timestamp),
+        )
+        with self.database.transaction() as session:
+            session.execute(
+                update(OutboxModel)
+                .where(OutboxModel.attempt_count >= max_attempts, available)
+                .values(
+                    status="failed",
+                    locked_until=None,
+                    lock_token=None,
+                    last_error="Maximum delivery attempts exceeded",
+                    updated_at=timestamp,
                 )
-                """,
-                (timestamp, max_attempts, timestamp, timestamp),
             )
-            candidates = connection.execute(
-                """
-                SELECT id FROM outbox
-                WHERE attempt_count < ? AND (
-                    (status = 'pending' AND available_at <= ?)
-                    OR (status = 'processing' AND locked_until <= ?)
-                )
-                ORDER BY available_at, id
-                LIMIT ?
-                """,
-                (max_attempts, timestamp, timestamp, limit),
-            ).fetchall()
-
-            for candidate in candidates:
-                token = uuid.uuid4().hex
-                connection.execute(
-                    """
-                    UPDATE outbox SET
-                        status = 'processing',
-                        attempt_count = attempt_count + 1,
-                        locked_until = ?,
-                        lock_token = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (timestamp + lease_seconds, token, timestamp, candidate["id"]),
-                )
-                row = connection.execute(
-                    "SELECT * FROM outbox WHERE id = ?", (candidate["id"],)
-                ).fetchone()
-                claimed.append(self._from_row(row))
+            candidates = session.scalars(
+                select(OutboxModel)
+                .where(OutboxModel.attempt_count < max_attempts, available)
+                .order_by(OutboxModel.available_at, OutboxModel.id)
+                .limit(limit)
+                .with_for_update(skip_locked=self.database.is_postgresql)
+            ).all()
+            for row in candidates:
+                row.status = "processing"
+                row.attempt_count += 1
+                row.locked_until = timestamp + lease_seconds
+                row.lock_token = uuid.uuid4().hex
+                row.updated_at = timestamp
+                claimed.append(self._from_model(row))
+            session.flush()
         return claimed
 
     def mark_success(
         self, message_id: int, lock_token: str, *, now: Optional[int] = None
     ) -> bool:
         timestamp = _now(now)
-        with self.database.transaction() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE outbox SET
-                    status = 'succeeded', locked_until = NULL, lock_token = NULL,
-                    last_error = NULL, succeeded_at = ?, updated_at = ?
-                WHERE id = ? AND status = 'processing' AND lock_token = ?
-                """,
-                (timestamp, timestamp, int(message_id), lock_token),
+        with self.database.transaction() as session:
+            result = session.execute(
+                update(OutboxModel)
+                .where(
+                    OutboxModel.id == int(message_id),
+                    OutboxModel.status == "processing",
+                    OutboxModel.lock_token == lock_token,
+                )
+                .values(
+                    status="succeeded",
+                    locked_until=None,
+                    lock_token=None,
+                    last_error=None,
+                    succeeded_at=timestamp,
+                    updated_at=timestamp,
+                )
             )
-            return cursor.rowcount == 1
+            return result.rowcount == 1
 
     success = mark_success
 
@@ -1411,23 +1254,24 @@ class OutboxRepository:
         if delay_seconds < 0:
             raise ValueError("delay_seconds must not be negative")
         timestamp = _now(now)
-        with self.database.transaction() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE outbox SET
-                    status = 'pending', available_at = ?, locked_until = NULL,
-                    lock_token = NULL, last_error = ?, updated_at = ?
-                WHERE id = ? AND status = 'processing' AND lock_token = ?
-                """,
-                (
-                    timestamp + int(delay_seconds),
-                    self._safe_error(error),
-                    timestamp,
-                    int(message_id),
-                    lock_token,
-                ),
+        with self.database.transaction() as session:
+            result = session.execute(
+                update(OutboxModel)
+                .where(
+                    OutboxModel.id == int(message_id),
+                    OutboxModel.status == "processing",
+                    OutboxModel.lock_token == lock_token,
+                )
+                .values(
+                    status="pending",
+                    available_at=timestamp + int(delay_seconds),
+                    locked_until=None,
+                    lock_token=None,
+                    last_error=self._safe_error(error),
+                    updated_at=timestamp,
+                )
             )
-            return cursor.rowcount == 1
+            return result.rowcount == 1
 
     retry = mark_retry
 
@@ -1440,46 +1284,70 @@ class OutboxRepository:
         now: Optional[int] = None,
     ) -> bool:
         timestamp = _now(now)
-        with self.database.transaction() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE outbox SET
-                    status = 'failed', locked_until = NULL, lock_token = NULL,
-                    last_error = ?, updated_at = ?
-                WHERE id = ? AND status = 'processing' AND lock_token = ?
-                """,
-                (
-                    self._safe_error(error),
-                    timestamp,
-                    int(message_id),
-                    lock_token,
-                ),
+        with self.database.transaction() as session:
+            result = session.execute(
+                update(OutboxModel)
+                .where(
+                    OutboxModel.id == int(message_id),
+                    OutboxModel.status == "processing",
+                    OutboxModel.lock_token == lock_token,
+                )
+                .values(
+                    status="failed",
+                    locked_until=None,
+                    lock_token=None,
+                    last_error=self._safe_error(error),
+                    updated_at=timestamp,
+                )
             )
-            return cursor.rowcount == 1
+            return result.rowcount == 1
 
     fail = mark_failed
 
     def get(self, message_id: int) -> Optional[OutboxMessage]:
-        with self.database.connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM outbox WHERE id = ?", (int(message_id),)
-            ).fetchone()
-        return self._from_row(row) if row is not None else None
+        with self.database.session() as session:
+            row = session.get(OutboxModel, int(message_id))
+            return self._from_model(row) if row is not None else None
 
     def get_for_order(self, order_id: str) -> Optional[OutboxMessage]:
         order_id = _required_text(order_id, "order_id")
-        with self.database.connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM outbox WHERE order_id = ? ORDER BY id DESC LIMIT 1",
-                (order_id,),
-            ).fetchone()
-        return self._from_row(row) if row is not None else None
+        with self.database.session() as session:
+            row = session.scalar(
+                select(OutboxModel)
+                .where(OutboxModel.order_id == order_id)
+                .order_by(OutboxModel.id.desc())
+                .limit(1)
+            )
+            return self._from_model(row) if row is not None else None
 
     def count(self, *, status: Optional[str] = None) -> int:
-        query = "SELECT COUNT(*) FROM outbox"
-        parameters: Tuple[object, ...] = ()
+        statement = select(func.count()).select_from(OutboxModel)
         if status is not None:
-            query += " WHERE status = ?"
-            parameters = (status,)
-        with self.database.connection() as connection:
-            return int(connection.execute(query, parameters).fetchone()[0])
+            statement = statement.where(OutboxModel.status == status)
+        with self.database.session() as session:
+            return int(session.scalar(statement) or 0)
+
+
+__all__ = [
+    "CreateOrderResult",
+    "IdempotencyConflictError",
+    "InvalidOrderError",
+    "OrderDraft",
+    "OrderItemInput",
+    "OrderItemSnapshot",
+    "OrderRepository",
+    "OrderResponse",
+    "OutboxMessage",
+    "OutboxRepository",
+    "Product",
+    "ProductAlreadyExistsError",
+    "ProductCatalogError",
+    "ProductNotFoundError",
+    "ProductPriceTier",
+    "ProductRepository",
+    "RateLimitRepository",
+    "RateLimitResult",
+    "RepositoryError",
+    "UnknownProductError",
+    "WebhookOrder",
+]
