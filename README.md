@@ -196,7 +196,7 @@ Endpoint выполняет тот же server-side calculation, но не со�
 }
 ```
 
-Основные поля ответа:
+Полный канонический response:
 
 ```json
 {
@@ -212,10 +212,12 @@ Endpoint выполняет тот же server-side calculation, но не со�
       "lineAmountKopecks": 1450000,
       "weightPerBoxGrams": 10900,
       "totalWeightGrams": 54500,
+      "boxVolumeMm3": 17490000,
       "lengthMm": 330,
       "widthMm": 200,
       "heightMm": 265,
-      "cargoPlaces": 5
+      "cargoPlaces": 5,
+      "totalVolumeMm3": 87450000
     }
   ],
   "totals": {
@@ -223,12 +225,13 @@ Endpoint выполняет тот же server-side calculation, но не со�
     "totalUnits": 50,
     "productsAmountKopecks": 1450000,
     "totalWeightGrams": 54500,
-    "cargoPlaces": 5
+    "cargoPlaces": 5,
+    "totalVolumeMm3": 87450000
   }
 }
 ```
 
-`productsAmountKopecks` содержит только стоимость товаров. Цена доставки пока не рассчитывается: backend не обращается к API СДЭК и не создаёт фиктивный delivery amount.
+Backend возвращает только канонические технические единицы: копейки, граммы, миллиметры и мм³. Форматирование в ₽, килограммы или м³ при необходимости выполняет frontend. `productsAmountKopecks` содержит только стоимость товаров. Цена доставки пока не рассчитывается: backend не обращается к API СДЭК и не создаёт фиктивный delivery amount.
 
 ## Контракт `POST /api/orders`
 

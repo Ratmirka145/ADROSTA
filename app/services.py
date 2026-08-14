@@ -4,7 +4,6 @@ import logging
 import math
 import sqlite3
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
@@ -56,8 +55,6 @@ from app.security import canonical_hmac, is_valid_idempotency_key
 
 
 logger = logging.getLogger("adrosta.orders")
-_GRAMS_PER_KILOGRAM = Decimal(1_000)
-_MM3_PER_M3 = Decimal(1_000_000_000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,8 +350,6 @@ class OrderService:
                 height_mm=item.box_height_mm,
                 cargo_places=item.cargo_places,
                 total_volume_mm3=item.total_volume_mm3,
-                weight_kg=(Decimal(item.total_weight_grams) / _GRAMS_PER_KILOGRAM),
-                volume_m3=(Decimal(item.total_volume_mm3) / _MM3_PER_M3),
             )
             for item in stored.items
         ]
@@ -365,8 +360,6 @@ class OrderService:
             total_weight_grams=stored.total_weight_grams,
             cargo_places=stored.cargo_places,
             total_volume_mm3=stored.total_volume_mm3,
-            weight_kg=Decimal(stored.total_weight_grams) / _GRAMS_PER_KILOGRAM,
-            volume_m3=Decimal(stored.total_volume_mm3) / _MM3_PER_M3,
         )
         return OrderResponse(
             order_id=UUID(stored.order_id),

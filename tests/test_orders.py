@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
-from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -51,34 +50,32 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
     assert body["status"] == "accepted"
     assert body["integrationStatus"] == "stored"
     assert body["replayed"] is False
-    assert body["totals"]["boxes"] == 3
-    assert body["totals"]["weightGrams"] == 50_000
-    assert body["totals"]["volumeMm3"] == 480_000_000
-    assert Decimal(str(body["totals"]["weightKg"])) == Decimal("50")
-    assert Decimal(str(body["totals"]["volumeM3"])) == Decimal("0.48")
-    assert {
+    assert body["items"][0] == {
         "sku": "ADR-001",
+        "name": "ADROSTA test product 1",
         "boxes": 2,
-        "boxWeightGrams": 12_500,
+        "unitsPerBox": 10,
+        "units": 20,
+        "pricePerUnitKopecks": 10_000,
+        "pricePerBoxKopecks": 100_000,
+        "lineAmountKopecks": 200_000,
+        "weightPerBoxGrams": 12_500,
+        "totalWeightGrams": 25_000,
         "boxVolumeMm3": 120_000_000,
         "lengthMm": 600,
         "widthMm": 400,
         "heightMm": 500,
-        "weightGrams": 25_000,
-        "volumeMm3": 240_000_000,
-        "weightKg": "25",
-        "volumeM3": "0.24",
-    }.items() <= body["items"][0].items()
-    assert body["items"][0]["name"] == "ADROSTA test product 1"
-    assert body["items"][0]["unitsPerBox"] == 10
-    assert body["items"][0]["units"] == 20
-    assert body["items"][0]["pricePerUnitKopecks"] == 10_000
-    assert body["items"][0]["pricePerBoxKopecks"] == 100_000
-    assert body["items"][0]["lineAmountKopecks"] == 200_000
-    assert body["totals"]["totalBoxes"] == 3
-    assert body["totals"]["totalUnits"] == 40
-    assert body["totals"]["productsAmountKopecks"] == 600_000
-    assert body["totals"]["cargoPlaces"] == 3
+        "cargoPlaces": 2,
+        "totalVolumeMm3": 240_000_000,
+    }
+    assert body["totals"] == {
+        "totalBoxes": 3,
+        "totalUnits": 40,
+        "productsAmountKopecks": 600_000,
+        "totalWeightGrams": 50_000,
+        "cargoPlaces": 3,
+        "totalVolumeMm3": 480_000_000,
+    }
 
     with app.state.context.database.connection() as connection:
         stored = connection.execute(

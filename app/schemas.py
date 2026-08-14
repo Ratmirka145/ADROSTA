@@ -8,7 +8,6 @@ totals are resolved and calculated by the domain layer.
 from __future__ import annotations
 
 import re
-from decimal import Decimal
 from enum import Enum
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -21,7 +20,6 @@ from pydantic import (
     Field,
     StrictInt,
     StringConstraints,
-    computed_field,
     field_validator,
     model_validator,
 )
@@ -336,23 +334,6 @@ class CalculatedItemResponse(ApiModel):
     height_mm: int
     cargo_places: int
     total_volume_mm3: int
-    weight_kg: Decimal
-    volume_m3: Decimal
-
-    @computed_field(alias="boxWeightGrams")
-    @property
-    def legacy_box_weight_grams(self) -> int:
-        return self.weight_per_box_grams
-
-    @computed_field(alias="weightGrams")
-    @property
-    def legacy_weight_grams(self) -> int:
-        return self.total_weight_grams
-
-    @computed_field(alias="volumeMm3")
-    @property
-    def legacy_volume_mm3(self) -> int:
-        return self.total_volume_mm3
 
 
 class OrderTotalsResponse(ApiModel):
@@ -362,23 +343,6 @@ class OrderTotalsResponse(ApiModel):
     total_weight_grams: int
     cargo_places: int
     total_volume_mm3: int
-    weight_kg: Decimal
-    volume_m3: Decimal
-
-    @computed_field(alias="boxes")
-    @property
-    def legacy_boxes(self) -> int:
-        return self.total_boxes
-
-    @computed_field(alias="weightGrams")
-    @property
-    def legacy_weight_grams(self) -> int:
-        return self.total_weight_grams
-
-    @computed_field(alias="volumeMm3")
-    @property
-    def legacy_volume_mm3(self) -> int:
-        return self.total_volume_mm3
 
 
 class OrderCalculationResponse(ApiModel):

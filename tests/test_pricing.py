@@ -67,6 +67,46 @@ def test_cart_calculation_uses_per_sku_tier_boundaries(
     assert response.status_code == 200
     body = response.json()
     item = body["items"][0]
+    assert set(item) == {
+        "sku",
+        "name",
+        "boxes",
+        "unitsPerBox",
+        "units",
+        "pricePerUnitKopecks",
+        "pricePerBoxKopecks",
+        "lineAmountKopecks",
+        "weightPerBoxGrams",
+        "totalWeightGrams",
+        "boxVolumeMm3",
+        "lengthMm",
+        "widthMm",
+        "heightMm",
+        "cargoPlaces",
+        "totalVolumeMm3",
+    }
+    assert set(body["totals"]) == {
+        "totalBoxes",
+        "totalUnits",
+        "productsAmountKopecks",
+        "totalWeightGrams",
+        "cargoPlaces",
+        "totalVolumeMm3",
+    }
+    assert not {
+        "weightKg",
+        "volumeM3",
+        "boxWeightGrams",
+        "weightGrams",
+        "volumeMm3",
+    } & set(item)
+    assert not {
+        "boxes",
+        "weightKg",
+        "volumeM3",
+        "weightGrams",
+        "volumeMm3",
+    } & set(body["totals"])
     assert item["sku"] == "opt-san-green"
     assert item["name"] == "SAN Green"
     assert item["boxes"] == boxes
@@ -87,6 +127,7 @@ def test_cart_calculation_uses_per_sku_tier_boundaries(
     assert body["totals"]["totalBoxes"] == boxes
     assert body["totals"]["totalUnits"] == boxes * 10
     assert body["totals"]["cargoPlaces"] == boxes
+    assert body["totals"]["totalVolumeMm3"] == boxes * 17_490_000
 
     with application.state.context.database.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
@@ -127,6 +168,41 @@ def test_cart_calculates_tier_separately_for_each_sku(
     assert body["totals"]["productsAmountKopecks"] == 3_020_000
     assert body["totals"]["totalWeightGrams"] == 109_000
     assert body["totals"]["cargoPlaces"] == 10
+    assert body["totals"]["totalVolumeMm3"] == 174_900_000
+
+
+def test_openapi_documents_only_canonical_calculation_fields(
+    app_factory: Callable[..., FastAPI],
+) -> None:
+    application = app_factory()
+    schemas = application.openapi()["components"]["schemas"]
+
+    assert set(schemas["CalculatedItemResponse"]["properties"]) == {
+        "sku",
+        "name",
+        "boxes",
+        "unitsPerBox",
+        "units",
+        "pricePerUnitKopecks",
+        "pricePerBoxKopecks",
+        "lineAmountKopecks",
+        "weightPerBoxGrams",
+        "totalWeightGrams",
+        "boxVolumeMm3",
+        "lengthMm",
+        "widthMm",
+        "heightMm",
+        "cargoPlaces",
+        "totalVolumeMm3",
+    }
+    assert set(schemas["OrderTotalsResponse"]["properties"]) == {
+        "totalBoxes",
+        "totalUnits",
+        "productsAmountKopecks",
+        "totalWeightGrams",
+        "cargoPlaces",
+        "totalVolumeMm3",
+    }
 
 
 def test_cart_rejects_unknown_sku_without_creating_order(
