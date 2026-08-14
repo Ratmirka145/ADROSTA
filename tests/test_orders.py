@@ -87,14 +87,14 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
     assert stored["recipient_email"] == "recipient@example.com"
 
 
-def test_creates_legal_order_and_persists_required_company(
+def test_creates_business_order_and_persists_required_company(
     client: TestClient,
     app: FastAPI,
     order_payload_factory: OrderPayloadFactory,
 ) -> None:
-    payload = order_payload_factory(legal=True)
+    payload = order_payload_factory(business=True)
 
-    response = _post_order(client, payload, key="legal-order-key-0001")
+    response = _post_order(client, payload, key="business-order-key-0001")
 
     assert response.status_code == 201
     order_id = response.json()["orderId"]
@@ -109,11 +109,44 @@ def test_creates_legal_order_and_persists_required_company(
         ).fetchone()
     assert stored is not None
     assert dict(stored) == {
-        "buyer_type": "legal",
+        "buyer_type": "business",
         "company_name": "ООО Тест",
         "company_inn": "7707083893",
         "company_kpp": "773601001",
         "company_legal_address": "г. Москва, тестовый адрес, д. 1",
+    }
+
+
+def test_creates_business_order_for_individual_entrepreneur_without_kpp(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory(business=True)
+    payload["company"] = {
+        "name": "ИП Тест",
+        "inn": "123456789012",
+        "kpp": None,
+        "legalAddress": "г. Москва, тестовый адрес, д. 2",
+    }
+
+    response = _post_order(client, payload, key="entrepreneur-order-key-0001")
+
+    assert response.status_code == 201
+    order_id = response.json()["orderId"]
+    with app.state.context.database.connection() as connection:
+        stored = connection.execute(
+            """
+            SELECT buyer_type, company_inn, company_kpp
+            FROM orders WHERE id = ?
+            """,
+            (order_id,),
+        ).fetchone()
+    assert stored is not None
+    assert dict(stored) == {
+        "buyer_type": "business",
+        "company_inn": "123456789012",
+        "company_kpp": None,
     }
 
 
@@ -146,12 +179,12 @@ def test_rejects_invalid_buyer_phone_and_email(
     assert _order_count(app) == 0
 
 
-def test_rejects_legal_buyer_without_company(
+def test_rejects_business_buyer_without_company(
     client: TestClient,
     app: FastAPI,
     order_payload_factory: OrderPayloadFactory,
 ) -> None:
-    payload = order_payload_factory(legal=True)
+    payload = order_payload_factory(business=True)
     del payload["company"]
 
     response = _post_order(client, payload)
@@ -160,6 +193,56 @@ def test_rejects_legal_buyer_without_company(
     assert _error_code(response) == "VALIDATION_ERROR"
     assert response.json()["error"]["details"][0]["field"] == "company"
     assert response.json()["error"]["details"][0]["code"] == "REQUIRED_COMPANY"
+    assert _order_count(app) == 0
+
+
+def test_rejects_organization_without_kpp(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory(business=True)
+    payload["company"] = {
+        "name": "ООО Без КПП",
+        "inn": "7707083893",
+        "kpp": None,
+        "legalAddress": "г. Москва, тестовый адрес, д. 3",
+    }
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("field") == "company.kpp"
+        and detail.get("code") == "REQUIRED_KPP"
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_individual_entrepreneur_with_kpp(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory(business=True)
+    payload["company"] = {
+        "name": "ИП с КПП",
+        "inn": "123456789012",
+        "kpp": "773601001",
+        "legalAddress": "г. Москва, тестовый адрес, д. 4",
+    }
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("field") == "company.kpp"
+        and detail.get("code") == "KPP_NOT_ALLOWED"
+        for detail in response.json()["error"]["details"]
+    )
     assert _order_count(app) == 0
 
 
@@ -182,6 +265,25 @@ def test_rejects_company_for_individual_buyer(
     assert _error_code(response) == "VALIDATION_ERROR"
     assert response.json()["error"]["details"][0]["field"] == "company"
     assert response.json()["error"]["details"][0]["code"] == "COMPANY_NOT_ALLOWED"
+    assert _order_count(app) == 0
+
+
+def test_rejects_obsolete_legal_buyer_type(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+) -> None:
+    payload = order_payload_factory()
+    payload["buyer"]["type"] = "legal"  # type: ignore[index]
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert _error_code(response) == "VALIDATION_ERROR"
+    assert any(
+        detail.get("field") == "buyer.type"
+        for detail in response.json()["error"]["details"]
+    )
     assert _order_count(app) == 0
 
 

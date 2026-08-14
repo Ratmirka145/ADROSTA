@@ -95,7 +95,7 @@ NonEmpty500 = Annotated[
 ]
 Inn = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, pattern=r"^\d{10}$"),
+    StringConstraints(strip_whitespace=True, pattern=r"^(?:\d{10}|\d{12})$"),
 ]
 Kpp = Annotated[
     str,
@@ -119,7 +119,7 @@ class ApiModel(BaseModel):
 
 class BuyerType(str, Enum):
     INDIVIDUAL = "individual"
-    LEGAL = "legal"
+    BUSINESS = "business"
 
 
 class Buyer(ApiModel):
@@ -132,8 +132,27 @@ class Buyer(ApiModel):
 class Company(ApiModel):
     name: NonEmpty300
     inn: Inn
-    kpp: Kpp
+    kpp: Kpp | None = None
     legal_address: NonEmpty500
+
+    @field_validator("kpp", mode="before")
+    @classmethod
+    def normalize_empty_kpp(cls, value: Any) -> Any:
+        return _blank_to_none(value)
+
+    @model_validator(mode="after")
+    def validate_kpp_for_inn(self) -> Company:
+        if len(self.inn) == 10 and self.kpp is None:
+            raise PydanticCustomError(
+                "company_kpp_required",
+                "kpp is required for a company with a 10-digit INN",
+            )
+        if len(self.inn) == 12 and self.kpp is not None:
+            raise PydanticCustomError(
+                "company_kpp_forbidden",
+                "kpp must be omitted for an individual entrepreneur",
+            )
+        return self
 
 
 class Recipient(ApiModel):
@@ -203,10 +222,10 @@ class OrderCreateRequest(ApiModel):
 
     @model_validator(mode="after")
     def validate_conditional_fields(self) -> OrderCreateRequest:
-        if self.buyer.type is BuyerType.LEGAL and self.company is None:
+        if self.buyer.type is BuyerType.BUSINESS and self.company is None:
             raise PydanticCustomError(
                 "company_required",
-                "company is required for a legal buyer",
+                "company is required for a business buyer",
             )
         if self.buyer.type is BuyerType.INDIVIDUAL and self.company is not None:
             raise PydanticCustomError(

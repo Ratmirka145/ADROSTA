@@ -326,12 +326,22 @@ def _validation_detail(error: Mapping[str, Any]) -> ErrorDetail:
         "company_required": ErrorDetail(
             field="company",
             code="REQUIRED_COMPANY",
-            message="Для юридического лица заполните реквизиты компании.",
+            message="Для ООО или ИП заполните реквизиты.",
         ),
         "company_forbidden": ErrorDetail(
             field="company",
             code="COMPANY_NOT_ALLOWED",
             message="Для физического лица реквизиты компании не требуются.",
+        ),
+        "company_kpp_required": ErrorDetail(
+            field="company.kpp",
+            code="REQUIRED_KPP",
+            message="Для организации с 10-значным ИНН укажите КПП.",
+        ),
+        "company_kpp_forbidden": ErrorDetail(
+            field="company.kpp",
+            code="KPP_NOT_ALLOWED",
+            message="Для ИП КПП не указывается.",
         ),
         "delivery_destination_required": ErrorDetail(
             field="delivery",

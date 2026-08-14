@@ -109,10 +109,10 @@ def client(app: FastAPI) -> Iterator[TestClient]:
 
 @pytest.fixture
 def order_payload_factory() -> Callable[..., dict[str, object]]:
-    def make_payload(*, legal: bool = False) -> dict[str, object]:
+    def make_payload(*, business: bool = False) -> dict[str, object]:
         payload: dict[str, object] = {
             "buyer": {
-                "type": "legal" if legal else "individual",
+                "type": "business" if business else "individual",
                 "contactName": "Иван Петров",
                 "phone": "8 (999) 123-45-67",
                 "email": "buyer@EXAMPLE.COM",
@@ -137,7 +137,7 @@ def order_payload_factory() -> Callable[..., dict[str, object]]:
                 {"sku": "ADR-002", "boxes": 1},
             ],
         }
-        if legal:
+        if business:
             payload["company"] = {
                 "name": "ООО Тест",
                 "inn": "7707083893",

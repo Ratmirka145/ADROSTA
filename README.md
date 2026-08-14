@@ -72,7 +72,7 @@ flowchart LR
 
 - строгая проверка структуры и типов, неизвестные поля запрещены;
 - нормализация российского телефона `8XXXXXXXXXX` или `7XXXXXXXXXX` в `+7XXXXXXXXXX` и проверка email;
-- обязательная компания только для `buyer.type = legal`;
+- реквизиты компании обязательны для `buyer.type = business` и запрещены для `individual`;
 - ровно один пункт назначения: `pickupPoint` или `address`;
 - приём от клиента только `sku` и `boxes` для каждой позиции;
 - точный, регистрозависимый поиск активного SKU в SQLite;
@@ -179,14 +179,14 @@ python -m app.cli product activate --sku "SKU-001"
 
 | Поле | Правило |
 |---|---|
-| `buyer.type` | `individual` или `legal` |
+| `buyer.type` | `individual` или `business` |
 | `buyer.contactName` | Обязательно, 1–200 символов |
 | `buyer.phone` | 11 цифр, начинается с `7` или `8`; сервер сохраняет как `+7…` |
 | `buyer.email` | Обязательный корректный email |
-| `company` | Обязательно для `legal`, запрещено для `individual` |
+| `company` | Обязательно для `business`, запрещено для `individual` |
 | `company.name` | 1–300 символов |
-| `company.inn` | Ровно 10 цифр |
-| `company.kpp` | Ровно 9 цифр |
+| `company.inn` | 10 цифр для организации или 12 цифр для ИП |
+| `company.kpp` | Ровно 9 цифр и обязательно для 10-значного ИНН; отсутствует для ИП с 12-значным ИНН |
 | `company.legalAddress` | 1–500 символов |
 | `delivery.method` | Обязательно, 1–100 символов |
 | `delivery.transportCompany` | Необязательно, до 200 символов |

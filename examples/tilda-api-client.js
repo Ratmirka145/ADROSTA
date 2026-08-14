@@ -184,12 +184,12 @@
       })
     };
 
-    if (buyer.type === "legal") {
+    if (buyer.type === "business") {
       var company = requireObject(order.company, "организация");
       payload.company = {
         name: company.name,
         inn: company.inn,
-        kpp: company.kpp,
+        kpp: optional(company.kpp),
         legalAddress: company.legalAddress
       };
     }
