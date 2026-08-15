@@ -251,14 +251,15 @@ Backend возвращает только канонические технич�
 
 Backend обращается к официальному CDEK API v2 только server-to-server. Поддержаны test (`api.edu.cdek.ru`) и production (`api.cdek.ru`) environments; конкретный host выбирается только через `CDEK_ENV`, а frontend не может передать URL, client ID, secret или access token. Реализация сверена с [официальным SDK CDEK-IT](https://github.com/cdek-it/sdk2.0).
 
-Phase 1 поддерживает:
+Интеграция поддерживает:
 
 - OAuth `client_credentials` с process-local cache, блокировкой конкурентного refresh и однократным refresh/retry после HTTP 401;
 - поиск городов и получение только обычных ПВЗ, без постаматов;
 - расчёт и возврат всех совместимых тарифов без скрытого выбора самого дешёвого;
+- повторную server-side проверку выбранного тарифа и ПВЗ при создании заказа;
 - ограниченный retry временных сетевых ошибок/502/503/504 и безопасные API errors.
 
-Phase 1 не создаёт отправление или заказ в CDEK, не получает трек-номер, не синхронизирует статусы и не вызывает shipment/order endpoints.
+Интеграция не создаёт отправление или заказ в CDEK, не получает трек-номер, не синхронизирует статусы и не вызывает shipment/order endpoints. `POST /api/orders` создаёт только коммерческий заказ ADROSTA с неизменяемым snapshot проверенной доставки.
 
 ### Поиск города и ПВЗ
 
@@ -310,9 +311,11 @@ Frontend передаёт только `deliveryType`, город назначе
 | `company.legalAddress` | 1–500 символов |
 | `delivery.method` | Строго `self_pickup` или `cdek` |
 | `delivery.type` | Для СДЭК обязательно: `pickup` или `door`; для самовывоза отсутствует |
+| `delivery.toCityCode` | Положительный код города CDEK; обязателен для `cdek`, отсутствует для самовывоза |
+| `delivery.tariffCode` | Выбранный из quote тариф; обязателен для `cdek` и повторно проверяется backend |
 | `delivery.region` | Необязательно для СДЭК, до 200 символов |
-| `delivery.city` | Обязательно для СДЭК, до 200 символов |
-| `delivery.officeCode` | Необязательный код ПВЗ для `cdek/pickup`; для `door` запрещён |
+| `delivery.city` | Обязательно для `cdek/door`; для `pickup` достаточно `toCityCode` |
+| `delivery.officeCode` | Обязательный проверяемый код ПВЗ для `cdek/pickup`; для `door` запрещён |
 | `delivery.street`, `delivery.house` | Обязательны только для `cdek/door` |
 | `delivery.postcode`, `delivery.apartment` | Необязательны только для `cdek/door` |
 | `delivery.recipient.contactName` | Необязательно; если передан `recipient`, имя обязательно, до 200 символов |
@@ -340,9 +343,9 @@ Frontend передаёт только `deliveryType`, город назначе
   "delivery": {
     "method": "cdek",
     "type": "pickup",
-    "region": "Москва",
-    "city": "Москва",
-    "officeCode": null
+    "toCityCode": 44,
+    "tariffCode": 136,
+    "officeCode": "MSK123"
   }
 }
 ```
@@ -354,6 +357,8 @@ Frontend передаёт только `deliveryType`, город назначе
   "delivery": {
     "method": "cdek",
     "type": "door",
+    "toCityCode": 44,
+    "tariffCode": 137,
     "region": "Москва",
     "city": "Москва",
     "postcode": "115054",
@@ -364,7 +369,45 @@ Frontend передаёт только `deliveryType`, город назначе
 }
 ```
 
-Создание заказа пока сохраняет выбранный способ получения независимо от preview-тарифа. Стоимость доставки из quote не сохраняется навечно и должна быть повторно проверена перед будущим commercial payment/shipment flow.
+### Checkout с доставкой
+
+Порядок оформления:
+
+1. Frontend получает каноническую стоимость товаров через `POST /api/cart/calculate`.
+2. Для СДЭК frontend запрашивает `POST /api/delivery/cdek/quote` и даёт пользователю выбрать тариф и, для pickup, ПВЗ.
+3. Frontend отправляет в `POST /api/orders` только `toCityCode`, выбранные `tariffCode`/`officeCode`, адрес и товары — без цены доставки и без города отправления.
+4. Backend заново рассчитывает товары, строит CDEK packages из канонического каталога и получает актуальные тарифы server-to-server.
+5. Выбранный тариф проверяется на доступность, `delivery.type` и `CDEK_ORIGIN_MODE`; для pickup выбранный ПВЗ дополнительно проверяется по `toCityCode`.
+6. Актуальная сумма CDEK преобразуется через `Decimal` в integer kopecks, после чего order, item snapshots, delivery snapshot, totals и outbox сохраняются одной транзакцией.
+
+Frontend-поля `deliveryAmount`, `deliveryAmountKopecks`, `deliveryPrice`, `price` и `fromCityCode` не входят в schema и отклоняются как неизвестные. Если CDEK недоступен или выбранный тариф исчез, заказ не создаётся; недоступный тариф возвращает `CDEK_TARIFF_UNAVAILABLE`. При изменении цены между preview и оформлением authoritative является новая сумма из финальной проверки.
+
+Для самовывоза CDEK не вызывается: `deliveryAmountKopecks=0`, а `grandTotalKopecks` равен `productsAmountKopecks`. Для CDEK `grandTotalKopecks = productsAmountKopecks + deliveryAmountKopecks`; все три значения сохраняются в PostgreSQL и возвращаются в response вместе с тарифом, сроком, ПВЗ или структурированным адресом.
+
+Пример части успешного ответа:
+
+```json
+{
+  "totals": {
+    "productsAmountKopecks": 1450000,
+    "deliveryAmountKopecks": 123450,
+    "grandTotalKopecks": 1573450
+  },
+  "delivery": {
+    "method": "cdek",
+    "type": "pickup",
+    "toCityCode": 44,
+    "tariffCode": 136,
+    "tariffName": "Посылка склад-склад",
+    "deliveryMode": 4,
+    "officeCode": "MSK123",
+    "periodMinDays": 2,
+    "periodMaxDays": 4
+  }
+}
+```
+
+Повтор уже сохранённого запроса с тем же `Idempotency-Key` возвращает snapshot заказа и не выполняет CDEK quote повторно. На этом этапе shipment, waybill и tracking в CDEK не создаются; это отдельный workflow после подтверждения оплаты/заказа.
 
 Для позиции заказа API принимает только `sku` и `boxes`. Поля цены, веса, объёма, размеров и клиентские totals будут отклонены как неизвестные. Общий предел коробок дополнительно задаёт `MAX_TOTAL_BOXES`.
 

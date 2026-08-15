@@ -121,6 +121,13 @@ class OrderDraft:
     company_kpp: Optional[str] = None
     company_legal_address: Optional[str] = None
     delivery_type: Optional[str] = None
+    cdek_to_city_code: Optional[int] = None
+    cdek_tariff_code: Optional[int] = None
+    cdek_tariff_name: Optional[str] = None
+    cdek_delivery_mode: Optional[int] = None
+    cdek_period_min_days: Optional[int] = None
+    cdek_period_max_days: Optional[int] = None
+    delivery_amount_kopecks: int = 0
     delivery_region: Optional[str] = None
     delivery_city: Optional[str] = None
     delivery_office_code: Optional[str] = None
@@ -188,12 +195,48 @@ class OrderResponse:
     total_boxes: int
     total_units: int
     products_amount_kopecks: int
+    delivery_amount_kopecks: int
+    grand_total_kopecks: int
     total_weight_grams: int
     total_volume_mm3: int
     cargo_places: int
+    delivery_method: str
+    delivery_type: Optional[str]
+    cdek_to_city_code: Optional[int]
+    cdek_tariff_code: Optional[int]
+    cdek_tariff_name: Optional[str]
+    cdek_delivery_mode: Optional[int]
+    cdek_period_min_days: Optional[int]
+    cdek_period_max_days: Optional[int]
+    delivery_region: Optional[str]
+    delivery_city: Optional[str]
+    delivery_office_code: Optional[str]
+    delivery_postcode: Optional[str]
+    delivery_street: Optional[str]
+    delivery_house: Optional[str]
+    delivery_apartment: Optional[str]
     items: Tuple[OrderItemSnapshot, ...]
 
     def as_dict(self) -> dict:
+        delivery = {"method": self.delivery_method}
+        for name, value in (
+            ("type", self.delivery_type),
+            ("toCityCode", self.cdek_to_city_code),
+            ("tariffCode", self.cdek_tariff_code),
+            ("tariffName", self.cdek_tariff_name),
+            ("deliveryMode", self.cdek_delivery_mode),
+            ("officeCode", self.delivery_office_code),
+            ("region", self.delivery_region),
+            ("city", self.delivery_city),
+            ("postcode", self.delivery_postcode),
+            ("street", self.delivery_street),
+            ("house", self.delivery_house),
+            ("apartment", self.delivery_apartment),
+            ("periodMinDays", self.cdek_period_min_days),
+            ("periodMaxDays", self.cdek_period_max_days),
+        ):
+            if value is not None:
+                delivery[name] = value
         return {
             "orderId": self.order_id,
             "status": self.status,
@@ -202,10 +245,13 @@ class OrderResponse:
                 "boxes": self.total_boxes,
                 "totalUnits": self.total_units,
                 "productsAmountKopecks": self.products_amount_kopecks,
+                "deliveryAmountKopecks": self.delivery_amount_kopecks,
+                "grandTotalKopecks": self.grand_total_kopecks,
                 "weightGrams": self.total_weight_grams,
                 "volumeMm3": self.total_volume_mm3,
                 "cargoPlaces": self.cargo_places,
             },
+            "delivery": delivery,
             "items": [item.as_dict() for item in self.items],
         }
 
@@ -241,6 +287,12 @@ class WebhookOrder:
     company_legal_address: Optional[str]
     delivery_method: str
     delivery_type: Optional[str]
+    cdek_to_city_code: Optional[int]
+    cdek_tariff_code: Optional[int]
+    cdek_tariff_name: Optional[str]
+    cdek_delivery_mode: Optional[int]
+    cdek_period_min_days: Optional[int]
+    cdek_period_max_days: Optional[int]
     delivery_region: Optional[str]
     delivery_city: Optional[str]
     delivery_office_code: Optional[str]
@@ -255,6 +307,8 @@ class WebhookOrder:
     total_boxes: int
     total_units: int
     products_amount_kopecks: int
+    delivery_amount_kopecks: int
+    grand_total_kopecks: int
     total_weight_grams: int
     total_volume_mm3: int
     cargo_places: int
@@ -280,6 +334,10 @@ class WebhookOrder:
         delivery = {"method": self.delivery_method}
         for name, value in (
             ("type", self.delivery_type),
+            ("toCityCode", self.cdek_to_city_code),
+            ("tariffCode", self.cdek_tariff_code),
+            ("tariffName", self.cdek_tariff_name),
+            ("deliveryMode", self.cdek_delivery_mode),
             ("region", self.delivery_region),
             ("city", self.delivery_city),
             ("officeCode", self.delivery_office_code),
@@ -287,6 +345,8 @@ class WebhookOrder:
             ("street", self.delivery_street),
             ("house", self.delivery_house),
             ("apartment", self.delivery_apartment),
+            ("periodMinDays", self.cdek_period_min_days),
+            ("periodMaxDays", self.cdek_period_max_days),
         ):
             if value is not None:
                 delivery[name] = value
@@ -320,6 +380,8 @@ class WebhookOrder:
                 "boxes": self.total_boxes,
                 "totalUnits": self.total_units,
                 "productsAmountKopecks": self.products_amount_kopecks,
+                "deliveryAmountKopecks": self.delivery_amount_kopecks,
+                "grandTotalKopecks": self.grand_total_kopecks,
                 "weightGrams": self.total_weight_grams,
                 "volumeMm3": self.total_volume_mm3,
                 "cargoPlaces": self.cargo_places,
@@ -376,6 +438,14 @@ def _required_text(value: str, field: str) -> str:
 def _positive_integer(value: int, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field} must be a positive integer")
+    if value > _MAX_BIGINT:
+        raise ValueError(f"{field} exceeds database bigint range")
+    return value
+
+
+def _non_negative_integer(value: int, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
     if value > _MAX_BIGINT:
         raise ValueError(f"{field} exceeds database bigint range")
     return value
@@ -765,6 +835,12 @@ class OrderRepository:
                 value is not None
                 for value in (
                     draft.delivery_type,
+                    draft.cdek_to_city_code,
+                    draft.cdek_tariff_code,
+                    draft.cdek_tariff_name,
+                    draft.cdek_delivery_mode,
+                    draft.cdek_period_min_days,
+                    draft.cdek_period_max_days,
                     draft.delivery_region,
                     draft.delivery_city,
                     draft.delivery_office_code,
@@ -775,14 +851,40 @@ class OrderRepository:
                 )
             ):
                 raise InvalidOrderError("self_pickup must not contain CDEK fields")
+            if draft.delivery_amount_kopecks != 0:
+                raise InvalidOrderError("self_pickup delivery amount must be zero")
         else:
             if draft.delivery_type not in {"pickup", "door"}:
                 raise InvalidOrderError("CDEK delivery_type must be pickup or door")
             try:
-                _required_text(draft.delivery_city, "delivery_city")
+                _positive_integer(draft.cdek_to_city_code, "cdek_to_city_code")
+                _positive_integer(draft.cdek_tariff_code, "cdek_tariff_code")
+                _required_text(draft.cdek_tariff_name, "cdek_tariff_name")
+                delivery_mode = _positive_integer(
+                    draft.cdek_delivery_mode, "cdek_delivery_mode"
+                )
+                if delivery_mode > 4:
+                    raise ValueError("cdek_delivery_mode must be between 1 and 4")
+                _non_negative_integer(
+                    draft.delivery_amount_kopecks, "delivery_amount_kopecks"
+                )
+                period_min = _non_negative_integer(
+                    draft.cdek_period_min_days, "cdek_period_min_days"
+                )
+                period_max = _non_negative_integer(
+                    draft.cdek_period_max_days, "cdek_period_max_days"
+                )
+                if period_max < period_min:
+                    raise ValueError("CDEK delivery period is invalid")
             except ValueError as exc:
                 raise InvalidOrderError(str(exc)) from exc
             if draft.delivery_type == "pickup":
+                try:
+                    _required_text(
+                        draft.delivery_office_code, "delivery_office_code"
+                    )
+                except ValueError as exc:
+                    raise InvalidOrderError(str(exc)) from exc
                 if any(
                     value is not None
                     for value in (
@@ -794,7 +896,7 @@ class OrderRepository:
                 ):
                     raise InvalidOrderError("CDEK pickup must not contain door address fields")
             else:
-                for field in ("delivery_street", "delivery_house"):
+                for field in ("delivery_city", "delivery_street", "delivery_house"):
                     try:
                         _required_text(getattr(draft, field), field)
                     except ValueError as exc:
@@ -848,9 +950,26 @@ class OrderRepository:
             total_boxes=row.total_boxes,
             total_units=row.total_units,
             products_amount_kopecks=row.products_amount_kopecks,
+            delivery_amount_kopecks=row.delivery_amount_kopecks,
+            grand_total_kopecks=row.grand_total_kopecks,
             total_weight_grams=row.total_weight_grams,
             total_volume_mm3=row.total_volume_mm3,
             cargo_places=row.cargo_places,
+            delivery_method=row.delivery_method,
+            delivery_type=row.delivery_type,
+            cdek_to_city_code=row.cdek_to_city_code,
+            cdek_tariff_code=row.cdek_tariff_code,
+            cdek_tariff_name=row.cdek_tariff_name,
+            cdek_delivery_mode=row.cdek_delivery_mode,
+            cdek_period_min_days=row.cdek_period_min_days,
+            cdek_period_max_days=row.cdek_period_max_days,
+            delivery_region=row.delivery_region,
+            delivery_city=row.delivery_city,
+            delivery_office_code=row.delivery_office_code,
+            delivery_postcode=row.delivery_postcode,
+            delivery_street=row.delivery_street,
+            delivery_house=row.delivery_house,
+            delivery_apartment=row.delivery_apartment,
             items=cls._items_for_order(session, order_id),
         )
 
@@ -936,6 +1055,16 @@ class OrderRepository:
         )
         totals = calculation.totals
         try:
+            delivery_amount = _non_negative_integer(
+                draft.delivery_amount_kopecks, "delivery_amount_kopecks"
+            )
+            grand_total = _positive_integer(
+                totals.products_amount_kopecks + delivery_amount,
+                "grand_total_kopecks",
+            )
+        except ValueError as exc:
+            raise InvalidOrderError(str(exc)) from exc
+        try:
             request_hash = _required_text(request_hash, "request_hash")
             duplicate_fingerprint = _required_text(
                 duplicate_fingerprint, "duplicate_fingerprint"
@@ -1008,6 +1137,12 @@ class OrderRepository:
                     company_legal_address=draft.company_legal_address,
                     delivery_method=draft.delivery_method.strip(),
                     delivery_type=draft.delivery_type,
+                    cdek_to_city_code=draft.cdek_to_city_code,
+                    cdek_tariff_code=draft.cdek_tariff_code,
+                    cdek_tariff_name=draft.cdek_tariff_name,
+                    cdek_delivery_mode=draft.cdek_delivery_mode,
+                    cdek_period_min_days=draft.cdek_period_min_days,
+                    cdek_period_max_days=draft.cdek_period_max_days,
                     delivery_region=draft.delivery_region,
                     delivery_city=draft.delivery_city,
                     delivery_office_code=draft.delivery_office_code,
@@ -1022,6 +1157,8 @@ class OrderRepository:
                     total_boxes=totals.total_boxes,
                     total_units=totals.total_units,
                     products_amount_kopecks=totals.products_amount_kopecks,
+                    delivery_amount_kopecks=delivery_amount,
+                    grand_total_kopecks=grand_total,
                     total_weight_grams=totals.total_weight_grams,
                     total_volume_mm3=totals.total_volume_mm3,
                     cargo_places=totals.cargo_places,
@@ -1090,9 +1227,26 @@ class OrderRepository:
                 total_boxes=totals.total_boxes,
                 total_units=totals.total_units,
                 products_amount_kopecks=totals.products_amount_kopecks,
+                delivery_amount_kopecks=delivery_amount,
+                grand_total_kopecks=grand_total,
                 total_weight_grams=totals.total_weight_grams,
                 total_volume_mm3=totals.total_volume_mm3,
                 cargo_places=totals.cargo_places,
+                delivery_method=draft.delivery_method.strip(),
+                delivery_type=draft.delivery_type,
+                cdek_to_city_code=draft.cdek_to_city_code,
+                cdek_tariff_code=draft.cdek_tariff_code,
+                cdek_tariff_name=draft.cdek_tariff_name,
+                cdek_delivery_mode=draft.cdek_delivery_mode,
+                cdek_period_min_days=draft.cdek_period_min_days,
+                cdek_period_max_days=draft.cdek_period_max_days,
+                delivery_region=draft.delivery_region,
+                delivery_city=draft.delivery_city,
+                delivery_office_code=draft.delivery_office_code,
+                delivery_postcode=draft.delivery_postcode,
+                delivery_street=draft.delivery_street,
+                delivery_house=draft.delivery_house,
+                delivery_apartment=draft.delivery_apartment,
                 items=snapshots,
             )
             return CreateOrderResult(response, True, False, False)
@@ -1122,6 +1276,12 @@ class OrderRepository:
                 company_legal_address=row.company_legal_address,
                 delivery_method=row.delivery_method,
                 delivery_type=row.delivery_type,
+                cdek_to_city_code=row.cdek_to_city_code,
+                cdek_tariff_code=row.cdek_tariff_code,
+                cdek_tariff_name=row.cdek_tariff_name,
+                cdek_delivery_mode=row.cdek_delivery_mode,
+                cdek_period_min_days=row.cdek_period_min_days,
+                cdek_period_max_days=row.cdek_period_max_days,
                 delivery_region=row.delivery_region,
                 delivery_city=row.delivery_city,
                 delivery_office_code=row.delivery_office_code,
@@ -1136,6 +1296,8 @@ class OrderRepository:
                 total_boxes=row.total_boxes,
                 total_units=row.total_units,
                 products_amount_kopecks=row.products_amount_kopecks,
+                delivery_amount_kopecks=row.delivery_amount_kopecks,
+                grand_total_kopecks=row.grand_total_kopecks,
                 total_weight_grams=row.total_weight_grams,
                 total_volume_mm3=row.total_volume_mm3,
                 cargo_places=row.cargo_places,

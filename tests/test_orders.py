@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -10,9 +11,68 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from app.models import OrderModel
+from app.integrations import CdekTimeoutError, CdekUnavailableError
 
 
 OrderPayloadFactory = Callable[..., dict[str, object]]
+
+
+class FakeOrderCdekClient:
+    def __init__(self) -> None:
+        self.amount = "1234.50"
+        self.tariff_code = 136
+        self.tariff_calls = 0
+        self.office_calls = 0
+        self.error: Exception | None = None
+        self.office_city_code = 44
+        self.office_code = "MSK123"
+
+    def tariff_list(
+        self, payload: Mapping[str, Any], **kwargs: object
+    ) -> list[Mapping[str, Any]]:
+        assert kwargs["request_id"]
+        self.tariff_calls += 1
+        if self.error is not None:
+            raise self.error
+        assert payload["to_location"] == {"code": 44}
+        return [
+            {
+                "tariff_code": self.tariff_code,
+                "tariff_name": "Посылка склад-склад",
+                "tariff_description": "Тестовый тариф",
+                "delivery_mode": delivery_mode,
+                "delivery_sum": self.amount,
+                "period_min": 2,
+                "period_max": 4,
+            }
+            for delivery_mode in (3, 4)
+        ]
+
+    def delivery_points(self, **kwargs: object) -> list[Mapping[str, Any]]:
+        assert kwargs["request_id"]
+        self.office_calls += 1
+        if self.error is not None:
+            raise self.error
+        return [
+            {
+                "code": self.office_code,
+                "name": "ПВЗ Тест",
+                "type": "PVZ",
+                "location": {
+                    "address": "Москва, ул. Тестовая, 1",
+                    "city_code": self.office_city_code,
+                },
+            }
+        ]
+
+
+@pytest.fixture
+def order_cdek_client(app: FastAPI) -> FakeOrderCdekClient:
+    fake = FakeOrderCdekClient()
+    service = app.state.context.cdek_service
+    service.client = fake
+    service.from_city_code = 137
+    return fake
 
 
 def _post_order(
@@ -44,6 +104,16 @@ def _stored_order(
         order = session.get(OrderModel, order_id)
         assert order is not None
         return {name: getattr(order, name) for name in field_names}
+
+
+def _pickup_delivery(*, tariff_code: int = 136) -> dict[str, object]:
+    return {
+        "method": "cdek",
+        "type": "pickup",
+        "toCityCode": 44,
+        "tariffCode": tariff_code,
+        "officeCode": "MSK123",
+    }
 
 
 def test_creates_individual_order_and_recalculates_trusted_totals(
@@ -84,6 +154,8 @@ def test_creates_individual_order_and_recalculates_trusted_totals(
         "totalBoxes": 3,
         "totalUnits": 40,
         "productsAmountKopecks": 600_000,
+        "deliveryAmountKopecks": 0,
+        "grandTotalKopecks": 600_000,
         "totalWeightGrams": 50_000,
         "cargoPlaces": 3,
         "totalVolumeMm3": 480_000_000,
@@ -101,6 +173,7 @@ def test_creates_self_pickup_order_and_persists_only_delivery_method(
     client: TestClient,
     app: FastAPI,
     order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
 ) -> None:
     payload = order_payload_factory()
     payload["delivery"] = {"method": "self_pickup"}
@@ -108,12 +181,18 @@ def test_creates_self_pickup_order_and_persists_only_delivery_method(
     response = _post_order(client, payload, key="self-pickup-order-key-0001")
 
     assert response.status_code == 201
+    assert response.json()["delivery"]["method"] == "self_pickup"
+    assert response.json()["totals"]["deliveryAmountKopecks"] == 0
+    assert response.json()["totals"]["grandTotalKopecks"] == 600_000
+    assert order_cdek_client.tariff_calls == 0
+    assert order_cdek_client.office_calls == 0
     stored = _stored_order(
         app,
         response.json()["orderId"],
         "delivery_method", "delivery_type", "delivery_region", "delivery_city",
         "delivery_office_code", "delivery_postcode", "delivery_street",
-        "delivery_house", "delivery_apartment",
+        "delivery_house", "delivery_apartment", "delivery_amount_kopecks",
+        "grand_total_kopecks", "cdek_tariff_code",
     )
     assert stored == {
         "delivery_method": "self_pickup",
@@ -125,6 +204,9 @@ def test_creates_self_pickup_order_and_persists_only_delivery_method(
         "delivery_street": None,
         "delivery_house": None,
         "delivery_apartment": None,
+        "delivery_amount_kopecks": 0,
+        "grand_total_kopecks": 600_000,
+        "cdek_tariff_code": None,
     }
 
 
@@ -132,31 +214,64 @@ def test_creates_cdek_pickup_order_and_persists_delivery_fields(
     client: TestClient,
     app: FastAPI,
     order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
 ) -> None:
     payload = order_payload_factory()
     payload["delivery"] = {
         "method": "cdek",
         "type": "pickup",
-        "region": "Москва",
-        "city": "Москва",
-        "officeCode": None,
+        "toCityCode": 44,
+        "tariffCode": 136,
+        "officeCode": "MSK123",
     }
 
     response = _post_order(client, payload, key="cdek-pickup-order-key-0001")
 
     assert response.status_code == 201
+    body = response.json()
+    assert body["totals"]["deliveryAmountKopecks"] == 123_450
+    assert body["totals"]["grandTotalKopecks"] == 723_450
+    assert body["delivery"] == {
+        "method": "cdek",
+        "type": "pickup",
+        "toCityCode": 44,
+        "tariffCode": 136,
+        "tariffName": "Посылка склад-склад",
+        "deliveryMode": 4,
+        "officeCode": "MSK123",
+        "region": None,
+        "city": None,
+        "postcode": None,
+        "street": None,
+        "house": None,
+        "apartment": None,
+        "periodMinDays": 2,
+        "periodMaxDays": 4,
+    }
+    assert order_cdek_client.tariff_calls == 1
+    assert order_cdek_client.office_calls == 1
     stored = _stored_order(
         app,
         response.json()["orderId"],
         "delivery_method", "delivery_type", "delivery_region", "delivery_city",
-        "delivery_office_code",
+        "delivery_office_code", "cdek_to_city_code", "cdek_tariff_code",
+        "cdek_tariff_name", "cdek_delivery_mode", "cdek_period_min_days",
+        "cdek_period_max_days", "delivery_amount_kopecks", "grand_total_kopecks",
     )
     assert stored == {
         "delivery_method": "cdek",
         "delivery_type": "pickup",
-        "delivery_region": "Москва",
-        "delivery_city": "Москва",
-        "delivery_office_code": None,
+        "delivery_region": None,
+        "delivery_city": None,
+        "delivery_office_code": "MSK123",
+        "cdek_to_city_code": 44,
+        "cdek_tariff_code": 136,
+        "cdek_tariff_name": "Посылка склад-склад",
+        "cdek_delivery_mode": 4,
+        "cdek_period_min_days": 2,
+        "cdek_period_max_days": 4,
+        "delivery_amount_kopecks": 123_450,
+        "grand_total_kopecks": 723_450,
     }
 
 
@@ -164,11 +279,14 @@ def test_creates_cdek_door_order_and_persists_structured_address(
     client: TestClient,
     app: FastAPI,
     order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
 ) -> None:
     payload = order_payload_factory()
     payload["delivery"] = {
         "method": "cdek",
         "type": "door",
+        "toCityCode": 44,
+        "tariffCode": 136,
         "region": "Москва",
         "city": "Москва",
         "postcode": "115054",
@@ -180,12 +298,22 @@ def test_creates_cdek_door_order_and_persists_structured_address(
     response = _post_order(client, payload, key="cdek-door-order-key-0001")
 
     assert response.status_code == 201
+    body = response.json()
+    assert body["totals"]["deliveryAmountKopecks"] == 123_450
+    assert body["totals"]["grandTotalKopecks"] == 723_450
+    assert body["delivery"]["deliveryMode"] == 3
+    assert body["delivery"]["tariffName"] == "Посылка склад-склад"
+    assert order_cdek_client.tariff_calls == 1
+    assert order_cdek_client.office_calls == 0
     stored = _stored_order(
         app,
         response.json()["orderId"],
         "delivery_method", "delivery_type", "delivery_region", "delivery_city",
         "delivery_postcode", "delivery_street", "delivery_house",
-        "delivery_apartment", "delivery_office_code",
+        "delivery_apartment", "delivery_office_code", "cdek_to_city_code",
+        "cdek_tariff_code", "cdek_tariff_name", "cdek_delivery_mode",
+        "cdek_period_min_days", "cdek_period_max_days",
+        "delivery_amount_kopecks", "grand_total_kopecks",
     )
     assert stored == {
         "delivery_method": "cdek",
@@ -197,7 +325,213 @@ def test_creates_cdek_door_order_and_persists_structured_address(
         "delivery_house": "53",
         "delivery_apartment": "12",
         "delivery_office_code": None,
+        "cdek_to_city_code": 44,
+        "cdek_tariff_code": 136,
+        "cdek_tariff_name": "Посылка склад-склад",
+        "cdek_delivery_mode": 3,
+        "cdek_period_min_days": 2,
+        "cdek_period_max_days": 4,
+        "delivery_amount_kopecks": 123_450,
+        "grand_total_kopecks": 723_450,
     }
+
+
+def test_final_cdek_price_replaces_preview_and_uses_integer_grand_total(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
+) -> None:
+    order_cdek_client.amount = "1000.00"
+    preview = client.post(
+        "/api/delivery/cdek/quote",
+        json={
+            "deliveryType": "pickup",
+            "toCityCode": 44,
+            "items": [
+                {"sku": "ADR-001", "boxes": 2},
+                {"sku": "ADR-002", "boxes": 1},
+            ],
+        },
+    )
+    assert preview.status_code == 200
+    assert preview.json()["options"][0]["deliveryAmountKopecks"] == 100_000
+
+    order_cdek_client.amount = "1234.50"
+    payload = order_payload_factory()
+    payload["delivery"] = _pickup_delivery()
+    response = _post_order(client, payload, key="changed-cdek-price-key-0001")
+
+    assert response.status_code == 201
+    assert response.json()["totals"]["deliveryAmountKopecks"] == 123_450
+    assert response.json()["totals"]["grandTotalKopecks"] == 723_450
+    stored = _stored_order(
+        app,
+        response.json()["orderId"],
+        "products_amount_kopecks",
+        "delivery_amount_kopecks",
+        "grand_total_kopecks",
+    )
+    assert stored == {
+        "products_amount_kopecks": 600_000,
+        "delivery_amount_kopecks": 123_450,
+        "grand_total_kopecks": 723_450,
+    }
+
+
+def test_idempotent_cdek_replay_does_not_call_upstream_twice(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = _pickup_delivery()
+
+    first = _post_order(client, payload, key="idempotent-cdek-key-0001")
+    replay = _post_order(client, payload, key="idempotent-cdek-key-0001")
+
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert replay.json()["orderId"] == first.json()["orderId"]
+    assert replay.json()["replayed"] is True
+    assert replay.json()["totals"] == first.json()["totals"]
+    assert order_cdek_client.tariff_calls == 1
+    assert order_cdek_client.office_calls == 1
+    assert _order_count(app) == 1
+
+
+def test_unavailable_selected_tariff_does_not_create_order(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
+) -> None:
+    payload = order_payload_factory()
+    payload["delivery"] = _pickup_delivery(tariff_code=999)
+
+    response = _post_order(client, payload, key="missing-cdek-tariff-key-0001")
+
+    assert response.status_code == 422
+    assert _error_code(response) == "CDEK_TARIFF_UNAVAILABLE"
+    assert order_cdek_client.office_calls == 0
+    assert _order_count(app) == 0
+
+
+def test_office_must_belong_to_selected_cdek_city(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
+) -> None:
+    order_cdek_client.office_city_code = 77
+    payload = order_payload_factory()
+    payload["delivery"] = _pickup_delivery()
+
+    response = _post_order(client, payload, key="wrong-cdek-office-key-0001")
+
+    assert response.status_code == 422
+    assert _error_code(response) == "CDEK_OFFICE_UNAVAILABLE"
+    assert _order_count(app) == 0
+
+
+@pytest.mark.parametrize(
+    ("integration_error", "expected_status", "expected_code"),
+    (
+        (CdekTimeoutError("CDEK_TIMEOUT"), 504, "CDEK_TIMEOUT"),
+        (CdekUnavailableError("CDEK_UNAVAILABLE"), 503, "CDEK_UNAVAILABLE"),
+    ),
+)
+def test_cdek_failure_during_final_verification_does_not_create_order(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
+    integration_error: Exception,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    order_cdek_client.error = integration_error
+    payload = order_payload_factory()
+    payload["delivery"] = _pickup_delivery()
+
+    response = _post_order(client, payload, key="timeout-cdek-order-key-0001")
+
+    assert response.status_code == expected_status
+    assert _error_code(response) == expected_code
+    assert _order_count(app) == 0
+
+
+@pytest.mark.parametrize(
+    "price_field",
+    ("deliveryAmount", "deliveryAmountKopecks", "deliveryPrice", "price"),
+)
+def test_frontend_cannot_override_delivery_price(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
+    price_field: str,
+) -> None:
+    payload = order_payload_factory()
+    delivery = _pickup_delivery()
+    delivery[price_field] = 1
+    payload["delivery"] = delivery
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert any(
+        detail.get("field") == f"delivery.{price_field}"
+        and detail.get("code") == "UNKNOWN_FIELD"
+        for detail in response.json()["error"]["details"]
+    )
+    assert order_cdek_client.tariff_calls == 0
+    assert _order_count(app) == 0
+
+
+def test_frontend_cannot_override_cdek_origin_city(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    order_cdek_client: FakeOrderCdekClient,
+) -> None:
+    payload = order_payload_factory()
+    delivery = _pickup_delivery()
+    delivery["fromCityCode"] = 999
+    payload["delivery"] = delivery
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert any(
+        detail.get("field") == "delivery.fromCityCode"
+        and detail.get("code") == "UNKNOWN_FIELD"
+        for detail in response.json()["error"]["details"]
+    )
+    assert order_cdek_client.tariff_calls == 0
+    assert _order_count(app) == 0
+
+
+def test_openapi_exposes_order_delivery_selection_and_commercial_totals(
+    app: FastAPI,
+) -> None:
+    schemas = app.openapi()["components"]["schemas"]
+    delivery_properties = schemas["Delivery"]["properties"]
+    assert "toCityCode" in delivery_properties
+    assert "tariffCode" in delivery_properties
+    assert not {
+        "fromCityCode",
+        "deliveryAmount",
+        "deliveryAmountKopecks",
+        "deliveryPrice",
+        "price",
+    } & set(delivery_properties)
+    assert {
+        "productsAmountKopecks",
+        "deliveryAmountKopecks",
+        "grandTotalKopecks",
+    } <= set(schemas["OrderCommercialTotalsResponse"]["properties"])
 
 
 def test_rejects_cdek_without_delivery_type(
@@ -219,20 +553,54 @@ def test_rejects_cdek_without_delivery_type(
     assert _order_count(app) == 0
 
 
-def test_rejects_cdek_pickup_without_city(
+@pytest.mark.parametrize(
+    ("removed_field", "expected_code"),
+    (
+        ("toCityCode", "REQUIRED_CDEK_CITY_CODE"),
+        ("tariffCode", "REQUIRED_CDEK_TARIFF"),
+    ),
+)
+def test_rejects_cdek_without_server_verification_identifiers(
+    client: TestClient,
+    app: FastAPI,
+    order_payload_factory: OrderPayloadFactory,
+    removed_field: str,
+    expected_code: str,
+) -> None:
+    payload = order_payload_factory()
+    delivery = _pickup_delivery()
+    delivery.pop(removed_field)
+    payload["delivery"] = delivery
+
+    response = _post_order(client, payload)
+
+    assert response.status_code == 422
+    assert any(
+        detail.get("code") == expected_code
+        for detail in response.json()["error"]["details"]
+    )
+    assert _order_count(app) == 0
+
+
+def test_rejects_cdek_pickup_without_office(
     client: TestClient,
     app: FastAPI,
     order_payload_factory: OrderPayloadFactory,
 ) -> None:
     payload = order_payload_factory()
-    payload["delivery"] = {"method": "cdek", "type": "pickup"}
+    payload["delivery"] = {
+        "method": "cdek",
+        "type": "pickup",
+        "toCityCode": 44,
+        "tariffCode": 136,
+    }
 
     response = _post_order(client, payload)
 
     assert response.status_code == 422
     assert _error_code(response) == "VALIDATION_ERROR"
     assert any(
-        detail.get("code") == "REQUIRED_CITY"
+        detail.get("code") == "REQUIRED_CDEK_OFFICE"
         for detail in response.json()["error"]["details"]
     )
     assert _order_count(app) == 0
@@ -247,6 +615,8 @@ def test_rejects_cdek_door_without_street(
     payload["delivery"] = {
         "method": "cdek",
         "type": "door",
+        "toCityCode": 44,
+        "tariffCode": 136,
         "city": "Москва",
         "house": "53",
     }
@@ -271,6 +641,8 @@ def test_rejects_cdek_door_without_house(
     payload["delivery"] = {
         "method": "cdek",
         "type": "door",
+        "toCityCode": 44,
+        "tariffCode": 136,
         "city": "Москва",
         "street": "Дубининская",
     }
@@ -295,6 +667,8 @@ def test_rejects_office_code_for_cdek_door_delivery(
     payload["delivery"] = {
         "method": "cdek",
         "type": "door",
+        "toCityCode": 44,
+        "tariffCode": 136,
         "city": "Москва",
         "street": "Дубининская",
         "house": "53",
@@ -340,6 +714,9 @@ def test_rejects_door_address_fields_for_cdek_pickup(
     payload["delivery"] = {
         "method": "cdek",
         "type": "pickup",
+        "toCityCode": 44,
+        "tariffCode": 136,
+        "officeCode": "MSK123",
         "city": "Москва",
         "street": "Дубининская",
     }

@@ -20,9 +20,11 @@ router = APIRouter(prefix="/api/orders", tags=["orders"])
     responses={
         400: {"description": "Отсутствует корректный Idempotency-Key"},
         409: {"description": "Повторный заказ или конфликт ключа"},
-        422: {"description": "Некорректные данные или неизвестный SKU"},
+        422: {"description": "Некорректные данные, SKU или выбор CDEK"},
         429: {"description": "Превышен лимит запросов"},
-        503: {"description": "Каталог или хранилище недоступны"},
+        502: {"description": "Ошибка авторизации или ответа CDEK"},
+        503: {"description": "Каталог, хранилище или CDEK недоступны"},
+        504: {"description": "Таймаут CDEK"},
     },
 )
 def create_order(
@@ -49,6 +51,7 @@ def create_order(
         client_ip=client_ip,
         rate_limit_result=getattr(request.state, "rate_limit_result", None),
         rate_limit_error=getattr(request.state, "rate_limit_error", False),
+        request_id=getattr(request.state, "request_id", None),
     )
     if outcome.replayed:
         response.status_code = status.HTTP_200_OK

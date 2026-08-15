@@ -13,6 +13,7 @@ from sqlalchemy import event
 # app.main exposes a module-level ASGI app, so collection needs an explicit
 # isolated test URL before importing it.
 os.environ.setdefault("APP_ENV", "test")
+os.environ["DEBUG"] = "false"
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
 from app.config import Settings

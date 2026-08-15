@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -21,6 +21,7 @@ from app.domain import (
 )
 from app.errors import (
     CatalogUnavailableError,
+    CdekNotConfiguredError,
     DuplicateSkuError,
     DuplicateOrderError,
     IdempotencyConflictError as ApiIdempotencyConflictError,
@@ -46,16 +47,22 @@ from app.repositories import (
 )
 from app.schemas import (
     CalculatedItemResponse,
+    CdekTariffOptionResponse,
     CartCalculateRequest,
+    DeliveryMethod,
+    OrderCommercialTotalsResponse,
     OrderCalculationResponse,
     OrderCreate,
+    OrderDeliveryResponse,
     OrderResponse,
-    OrderTotalsResponse,
 )
 from app.security import canonical_hmac, is_valid_idempotency_key
 
 
 logger = logging.getLogger("adrosta.orders")
+
+if TYPE_CHECKING:
+    from app.cdek import CdekService
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,12 +95,17 @@ class OrderService:
         orders: OrderRepository | None,
         outbox: OutboxRepository,
         rate_limits: RateLimitRepository | None,
+        cdek_service: CdekService | None = None,
     ) -> None:
         self.settings = settings
         self.products = products
         self.orders = orders
         self.outbox = outbox
         self.rate_limits = rate_limits
+        self.cdek_service = cdek_service
+
+    def attach_cdek_service(self, cdek_service: CdekService) -> None:
+        self.cdek_service = cdek_service
 
     def create_order(
         self,
@@ -103,6 +115,7 @@ class OrderService:
         client_ip: str,
         rate_limit_result: RateLimitResult | None = None,
         rate_limit_error: bool = False,
+        request_id: str | None = None,
         now: int | None = None,
     ) -> CreateOrderOutcome:
         if (
@@ -172,10 +185,25 @@ class OrderService:
             )
 
         calculation = self.calculate_items(order.items)
+        selected_tariff: CdekTariffOptionResponse | None = None
+        if order.delivery.method is DeliveryMethod.CDEK:
+            if self.cdek_service is None:
+                raise CdekNotConfiguredError()
+            assert order.delivery.type is not None
+            assert order.delivery.to_city_code is not None
+            assert order.delivery.tariff_code is not None
+            selected_tariff = self.cdek_service.verify_selected_tariff(
+                delivery_type=order.delivery.type,
+                to_city_code=order.delivery.to_city_code,
+                tariff_code=order.delivery.tariff_code,
+                office_code=order.delivery.office_code,
+                calculation=calculation,
+                request_id=request_id,
+            )
 
         try:
             result = self.orders.create_order(
-                self._to_draft(order),
+                self._to_draft(order, selected_tariff=selected_tariff),
                 calculation=calculation,
                 request_hash=fingerprint,
                 duplicate_fingerprint=fingerprint,
@@ -281,7 +309,11 @@ class OrderService:
             raise ValidationAppError()
 
     @staticmethod
-    def _to_draft(order: OrderCreate) -> OrderDraft:
+    def _to_draft(
+        order: OrderCreate,
+        *,
+        selected_tariff: CdekTariffOptionResponse | None,
+    ) -> OrderDraft:
         company = order.company
         recipient = order.delivery.recipient
         return OrderDraft(
@@ -296,6 +328,25 @@ class OrderService:
             delivery_method=order.delivery.method.value,
             delivery_type=(
                 order.delivery.type.value if order.delivery.type is not None else None
+            ),
+            cdek_to_city_code=order.delivery.to_city_code,
+            cdek_tariff_code=(
+                selected_tariff.tariff_code if selected_tariff else None
+            ),
+            cdek_tariff_name=(
+                selected_tariff.tariff_name if selected_tariff else None
+            ),
+            cdek_delivery_mode=(
+                selected_tariff.delivery_mode if selected_tariff else None
+            ),
+            cdek_period_min_days=(
+                selected_tariff.period_min_days if selected_tariff else None
+            ),
+            cdek_period_max_days=(
+                selected_tariff.period_max_days if selected_tariff else None
+            ),
+            delivery_amount_kopecks=(
+                selected_tariff.delivery_amount_kopecks if selected_tariff else 0
             ),
             delivery_region=order.delivery.region,
             delivery_city=order.delivery.city,
@@ -360,13 +411,32 @@ class OrderService:
             )
             for item in stored.items
         ]
-        totals = OrderTotalsResponse(
+        totals = OrderCommercialTotalsResponse(
             total_boxes=stored.total_boxes,
             total_units=stored.total_units,
             products_amount_kopecks=stored.products_amount_kopecks,
+            delivery_amount_kopecks=stored.delivery_amount_kopecks,
+            grand_total_kopecks=stored.grand_total_kopecks,
             total_weight_grams=stored.total_weight_grams,
             cargo_places=stored.cargo_places,
             total_volume_mm3=stored.total_volume_mm3,
+        )
+        delivery = OrderDeliveryResponse(
+            method=stored.delivery_method,
+            type=stored.delivery_type,
+            to_city_code=stored.cdek_to_city_code,
+            tariff_code=stored.cdek_tariff_code,
+            tariff_name=stored.cdek_tariff_name,
+            delivery_mode=stored.cdek_delivery_mode,
+            office_code=stored.delivery_office_code,
+            region=stored.delivery_region,
+            city=stored.delivery_city,
+            postcode=stored.delivery_postcode,
+            street=stored.delivery_street,
+            house=stored.delivery_house,
+            apartment=stored.delivery_apartment,
+            period_min_days=stored.cdek_period_min_days,
+            period_max_days=stored.cdek_period_max_days,
         )
         return OrderResponse(
             order_id=UUID(stored.order_id),
@@ -375,6 +445,7 @@ class OrderService:
             replayed=replayed,
             items=items,
             totals=totals,
+            delivery=delivery,
         )
 
 

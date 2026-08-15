@@ -177,6 +177,8 @@ class Recipient(ApiModel):
 class Delivery(ApiModel):
     method: DeliveryMethod
     type: CdekDeliveryType | None = None
+    to_city_code: Annotated[StrictInt, Field(gt=0)] | None = None
+    tariff_code: Annotated[StrictInt, Field(gt=0)] | None = None
     region: NonEmpty200 | None = None
     city: NonEmpty200 | None = None
     office_code: NonEmpty100 | None = None
@@ -204,6 +206,8 @@ class Delivery(ApiModel):
     def validate_delivery_contract(self) -> Delivery:
         cdek_fields = (
             self.type,
+            self.to_city_code,
+            self.tariff_code,
             self.region,
             self.city,
             self.office_code,
@@ -225,13 +229,29 @@ class Delivery(ApiModel):
                 "cdek_type_required",
                 "delivery type is required for CDEK",
             )
-        if self.city is None:
+        if self.to_city_code is None:
+            raise PydanticCustomError(
+                "cdek_to_city_code_required",
+                "destination city code is required for CDEK",
+            )
+        if self.tariff_code is None:
+            raise PydanticCustomError(
+                "cdek_tariff_code_required",
+                "selected tariff code is required for CDEK",
+            )
+
+        if self.type is CdekDeliveryType.DOOR and self.city is None:
             raise PydanticCustomError(
                 "cdek_city_required",
-                "city is required for CDEK delivery",
+                "city is required for CDEK door delivery",
             )
 
         if self.type is CdekDeliveryType.PICKUP:
+            if self.office_code is None:
+                raise PydanticCustomError(
+                    "cdek_office_required",
+                    "office code is required for CDEK pickup",
+                )
             if any(
                 value is not None
                 for value in (self.postcode, self.street, self.house, self.apartment)
@@ -361,6 +381,29 @@ class OrderTotalsResponse(ApiModel):
     total_volume_mm3: int
 
 
+class OrderCommercialTotalsResponse(OrderTotalsResponse):
+    delivery_amount_kopecks: int
+    grand_total_kopecks: int
+
+
+class OrderDeliveryResponse(ApiModel):
+    method: DeliveryMethod
+    type: CdekDeliveryType | None = None
+    to_city_code: int | None = None
+    tariff_code: int | None = None
+    tariff_name: str | None = None
+    delivery_mode: int | None = None
+    office_code: str | None = None
+    region: str | None = None
+    city: str | None = None
+    postcode: str | None = None
+    street: str | None = None
+    house: str | None = None
+    apartment: str | None = None
+    period_min_days: int | None = None
+    period_max_days: int | None = None
+
+
 class OrderCalculationResponse(ApiModel):
     items: list[CalculatedItemResponse]
     totals: OrderTotalsResponse
@@ -405,7 +448,7 @@ class CdekCargoResponse(ApiModel):
 
 class CdekTariffOptionResponse(ApiModel):
     tariff_code: int
-    tariff_name: str
+    tariff_name: NonEmpty500
     tariff_description: str | None = None
     delivery_mode: int
     delivery_amount_kopecks: int
@@ -427,7 +470,8 @@ class OrderResponse(ApiModel):
     integration_status: Literal["pending", "stored", "delivered", "failed"]
     replayed: bool = False
     items: list[CalculatedItemResponse]
-    totals: OrderTotalsResponse
+    totals: OrderCommercialTotalsResponse
+    delivery: OrderDeliveryResponse
 
     @classmethod
     def from_domain(
@@ -437,14 +481,27 @@ class OrderResponse(ApiModel):
         calculation: Any,
         integration_status: Literal["pending", "stored", "delivered", "failed"],
         replayed: bool = False,
+        delivery: OrderDeliveryResponse | None = None,
+        delivery_amount_kopecks: int = 0,
     ) -> OrderResponse:
         rendered = OrderCalculationResponse.from_domain(calculation)
+        commercial_totals = OrderCommercialTotalsResponse(
+            **rendered.totals.model_dump(),
+            delivery_amount_kopecks=delivery_amount_kopecks,
+            grand_total_kopecks=(
+                rendered.totals.products_amount_kopecks
+                + delivery_amount_kopecks
+            ),
+        )
         return cls(
             order_id=order_id,
             integration_status=integration_status,
             replayed=replayed,
             items=rendered.items,
-            totals=rendered.totals,
+            totals=commercial_totals,
+            delivery=delivery or OrderDeliveryResponse(
+                method=DeliveryMethod.SELF_PICKUP
+            ),
         )
 
 
@@ -468,8 +525,10 @@ __all__ = [
     "DeliveryMethod",
     "NormalizedEmail",
     "OrderCalculationResponse",
+    "OrderCommercialTotalsResponse",
     "OrderCreate",
     "OrderCreateRequest",
+    "OrderDeliveryResponse",
     "OrderItem",
     "OrderResponse",
     "OrderTotalsResponse",

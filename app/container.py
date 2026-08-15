@@ -65,6 +65,7 @@ class ApplicationContext:
             origin_mode=settings.cdek_origin_mode,
             calculate_items=service.calculate_items,
         )
+        service.attach_cdek_service(cdek_service)
         return cls(
             settings=settings,
             database=database,

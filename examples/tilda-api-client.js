@@ -134,14 +134,18 @@
       payload = {
         method: "cdek",
         type: "pickup",
+        toCityCode: delivery.toCityCode,
+        tariffCode: delivery.tariffCode,
         region: optional(delivery.region),
-        city: delivery.city,
-        officeCode: optional(delivery.officeCode)
+        city: optional(delivery.city),
+        officeCode: delivery.officeCode
       };
     } else if (delivery.method === "cdek" && delivery.type === "door") {
       payload = {
         method: "cdek",
         type: "door",
+        toCityCode: delivery.toCityCode,
+        tariffCode: delivery.tariffCode,
         region: optional(delivery.region),
         city: delivery.city,
         postcode: optional(delivery.postcode),

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping
 import os
 import subprocess
 from threading import Barrier
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -34,6 +36,39 @@ pytestmark = [
         reason="TEST_DATABASE_URL is not set to a disposable PostgreSQL database",
     ),
 ]
+
+
+class PostgresFakeCdekClient:
+    def tariff_list(
+        self, payload: Mapping[str, Any], **kwargs: object
+    ) -> list[Mapping[str, Any]]:
+        assert payload["to_location"] == {"code": 44}
+        assert kwargs["request_id"]
+        return [
+            {
+                "tariff_code": 136,
+                "tariff_name": "Посылка склад-склад",
+                "delivery_mode": 4,
+                "delivery_sum": "1234.50",
+                "period_min": 2,
+                "period_max": 4,
+            }
+        ]
+
+    def delivery_points(self, **kwargs: object) -> list[Mapping[str, Any]]:
+        assert kwargs["city_code"] == 44
+        assert kwargs["request_id"]
+        return [
+            {
+                "code": "MSK123",
+                "name": "ПВЗ Тест",
+                "type": "PVZ",
+                "location": {
+                    "address": "Москва, ул. Тестовая, 1",
+                    "city_code": 44,
+                },
+            }
+        ]
 
 
 def _settings() -> Settings:
@@ -172,6 +207,57 @@ def test_postgresql_migration_seed_cart_order_and_outbox(postgres_app) -> None:
     assert message.status == "pending"
     claimed = context.outbox.claim(limit=1)
     assert [item.id for item in claimed] == [message.id]
+
+
+def test_postgresql_persists_verified_cdek_delivery_snapshot(postgres_app) -> None:
+    context = postgres_app.state.context
+    context.cdek_service.client = PostgresFakeCdekClient()
+    context.cdek_service.from_city_code = 137
+    with TestClient(postgres_app) as client:
+        response = client.post(
+            "/api/orders",
+            headers={"Idempotency-Key": "postgres-cdek-order-key-0001"},
+            json={
+                "buyer": {
+                    "type": "individual",
+                    "contactName": "Иван Петров",
+                    "phone": "8 (999) 123-45-67",
+                    "email": "buyer@example.com",
+                },
+                "delivery": {
+                    "method": "cdek",
+                    "type": "pickup",
+                    "toCityCode": 44,
+                    "tariffCode": 136,
+                    "officeCode": "MSK123",
+                },
+                "items": [{"sku": "opt-san-green", "boxes": 5}],
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["totals"]["productsAmountKopecks"] == 1_450_000
+    assert response.json()["totals"]["deliveryAmountKopecks"] == 123_450
+    assert response.json()["totals"]["grandTotalKopecks"] == 1_573_450
+    with context.database.session() as session:
+        order = session.get(OrderModel, response.json()["orderId"])
+        assert order is not None
+        assert order.cdek_to_city_code == 44
+        assert order.cdek_tariff_code == 136
+        assert order.cdek_tariff_name == "Посылка склад-склад"
+        assert order.cdek_delivery_mode == 4
+        assert order.delivery_office_code == "MSK123"
+        assert order.cdek_period_min_days == 2
+        assert order.cdek_period_max_days == 4
+        assert order.delivery_amount_kopecks == 123_450
+        assert order.grand_total_kopecks == 1_573_450
+    assert context.orders is not None
+    webhook_snapshot = context.orders.get_order_for_webhook(
+        response.json()["orderId"]
+    )
+    assert webhook_snapshot is not None
+    assert webhook_snapshot.as_dict()["delivery"]["tariffCode"] == 136
+    assert webhook_snapshot.as_dict()["totals"]["grandTotalKopecks"] == 1_573_450
 
 
 def test_postgresql_concurrent_idempotency_creates_one_order(postgres_app) -> None:

@@ -120,6 +120,34 @@ class OrderModel(Base):
             "products_amount_kopecks > 0", name="ck_orders_products_amount_positive"
         ),
         CheckConstraint(
+            "delivery_amount_kopecks >= 0",
+            name="ck_orders_delivery_amount_non_negative",
+        ),
+        CheckConstraint(
+            "grand_total_kopecks = products_amount_kopecks + delivery_amount_kopecks",
+            name="ck_orders_grand_total_sum",
+        ),
+        CheckConstraint(
+            "cdek_to_city_code IS NULL OR cdek_to_city_code > 0",
+            name="ck_orders_cdek_to_city_positive",
+        ),
+        CheckConstraint(
+            "cdek_tariff_code IS NULL OR cdek_tariff_code > 0",
+            name="ck_orders_cdek_tariff_positive",
+        ),
+        CheckConstraint(
+            "cdek_delivery_mode IS NULL OR cdek_delivery_mode BETWEEN 1 AND 4",
+            name="ck_orders_cdek_delivery_mode",
+        ),
+        CheckConstraint(
+            "cdek_period_min_days IS NULL OR cdek_period_min_days >= 0",
+            name="ck_orders_cdek_period_min_non_negative",
+        ),
+        CheckConstraint(
+            "cdek_period_max_days IS NULL OR cdek_period_max_days >= cdek_period_min_days",
+            name="ck_orders_cdek_period_range",
+        ),
+        CheckConstraint(
             "total_weight_grams > 0", name="ck_orders_total_weight_positive"
         ),
         CheckConstraint("cargo_places > 0", name="ck_orders_cargo_places_positive"),
@@ -142,6 +170,12 @@ class OrderModel(Base):
     company_legal_address: Mapped[str | None] = mapped_column(String(1000))
     delivery_method: Mapped[str] = mapped_column(String(128))
     delivery_type: Mapped[str | None] = mapped_column(String(32))
+    cdek_to_city_code: Mapped[int | None] = mapped_column(Integer)
+    cdek_tariff_code: Mapped[int | None] = mapped_column(Integer)
+    cdek_tariff_name: Mapped[str | None] = mapped_column(String(500))
+    cdek_delivery_mode: Mapped[int | None] = mapped_column(Integer)
+    cdek_period_min_days: Mapped[int | None] = mapped_column(Integer)
+    cdek_period_max_days: Mapped[int | None] = mapped_column(Integer)
     delivery_region: Mapped[str | None] = mapped_column(String(500))
     delivery_city: Mapped[str | None] = mapped_column(String(500))
     delivery_office_code: Mapped[str | None] = mapped_column(String(128))
@@ -156,6 +190,8 @@ class OrderModel(Base):
     total_boxes: Mapped[int] = mapped_column(Integer)
     total_units: Mapped[int] = mapped_column(BigInteger)
     products_amount_kopecks: Mapped[int] = mapped_column(BigInteger)
+    delivery_amount_kopecks: Mapped[int] = mapped_column(BigInteger)
+    grand_total_kopecks: Mapped[int] = mapped_column(BigInteger)
     total_weight_grams: Mapped[int] = mapped_column(BigInteger)
     total_volume_mm3: Mapped[int] = mapped_column(BigInteger)
     cargo_places: Mapped[int] = mapped_column(Integer)

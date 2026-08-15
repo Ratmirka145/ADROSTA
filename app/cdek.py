@@ -13,6 +13,8 @@ from app.errors import (
     CdekLocationNotFoundError,
     CdekNoTariffsError,
     CdekNotConfiguredError,
+    CdekOfficeUnavailableError,
+    CdekTariffUnavailableError,
     CdekTimeoutAppError,
     CdekUnavailableAppError,
 )
@@ -158,24 +160,30 @@ class CdekService:
     def quote(
         self, payload: CdekQuoteRequest, *, request_id: str | None = None
     ) -> CdekQuoteResponse:
-        client = self._configured_client()
-        if self.from_city_code is None:
-            raise CdekNotConfiguredError()
-
         calculation = self.calculate_items(payload.items)
-        request_payload = {
-            "type": 1,
-            "currency": 1,
-            "lang": "rus",
-            "from_location": {"code": self.from_city_code},
-            "to_location": {"code": payload.to_city_code},
-            "packages": build_cdek_packages(calculation),
-        }
-        try:
-            raw_tariffs = client.tariff_list(request_payload, request_id=request_id)
-            options = self._tariffs(raw_tariffs, payload.delivery_type)
-        except CdekClientError as exc:
-            self._raise_integration_error(exc)
+        return self.quote_calculation(
+            delivery_type=payload.delivery_type,
+            to_city_code=payload.to_city_code,
+            calculation=calculation,
+            request_id=request_id,
+        )
+
+    def quote_calculation(
+        self,
+        *,
+        delivery_type: CdekDeliveryType,
+        to_city_code: int,
+        calculation: OrderCalculation,
+        request_id: str | None = None,
+    ) -> CdekQuoteResponse:
+        """Quote canonical cargo already calculated by the order domain."""
+
+        options = self._quote_options(
+            delivery_type=delivery_type,
+            to_city_code=to_city_code,
+            calculation=calculation,
+            request_id=request_id,
+        )
         if not options:
             raise CdekNoTariffsError()
 
@@ -185,10 +193,11 @@ class CdekService:
                 item.period_min_days,
             )
         )
+        assert self.from_city_code is not None
         return CdekQuoteResponse(
-            delivery_type=payload.delivery_type,
+            delivery_type=delivery_type,
             from_city_code=self.from_city_code,
-            to_city_code=payload.to_city_code,
+            to_city_code=to_city_code,
             cargo=CdekCargoResponse(
                 total_boxes=calculation.totals.total_boxes,
                 total_weight_grams=calculation.totals.total_weight_grams,
@@ -196,6 +205,68 @@ class CdekService:
             ),
             options=options,
         )
+
+    def verify_selected_tariff(
+        self,
+        *,
+        delivery_type: CdekDeliveryType,
+        to_city_code: int,
+        tariff_code: int,
+        office_code: str | None,
+        calculation: OrderCalculation,
+        request_id: str | None = None,
+    ) -> CdekTariffOptionResponse:
+        """Return the current authoritative selected tariff or reject checkout."""
+
+        options = self._quote_options(
+            delivery_type=delivery_type,
+            to_city_code=to_city_code,
+            calculation=calculation,
+            request_id=request_id,
+        )
+        selected = next(
+            (option for option in options if option.tariff_code == tariff_code),
+            None,
+        )
+        if selected is None:
+            raise CdekTariffUnavailableError()
+
+        if delivery_type is CdekDeliveryType.PICKUP:
+            if office_code is None:
+                raise CdekOfficeUnavailableError()
+            offices = self.offices(city_code=to_city_code, request_id=request_id)
+            if not any(
+                office.code == office_code and office.city_code == to_city_code
+                for office in offices.items
+            ):
+                raise CdekOfficeUnavailableError()
+        return selected
+
+    def _quote_options(
+        self,
+        *,
+        delivery_type: CdekDeliveryType,
+        to_city_code: int,
+        calculation: OrderCalculation,
+        request_id: str | None,
+    ) -> list[CdekTariffOptionResponse]:
+        client = self._configured_client()
+        if self.from_city_code is None:
+            raise CdekNotConfiguredError()
+        request_payload = {
+            "type": 1,
+            "currency": 1,
+            "lang": "rus",
+            "from_location": {"code": self.from_city_code},
+            "to_location": {"code": to_city_code},
+            "packages": build_cdek_packages(calculation),
+        }
+        try:
+            raw_tariffs = client.tariff_list(request_payload, request_id=request_id)
+            options = self._tariffs(raw_tariffs, delivery_type)
+        except CdekClientError as exc:
+            self._raise_integration_error(exc)
+        return options
 
     def _configured_client(self) -> CdekApi:
         if self.client is None:

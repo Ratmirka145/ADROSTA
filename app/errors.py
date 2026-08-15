@@ -47,6 +47,8 @@ class ErrorCode(str, Enum):
     CDEK_BAD_RESPONSE = "CDEK_BAD_RESPONSE"
     CDEK_LOCATION_NOT_FOUND = "CDEK_LOCATION_NOT_FOUND"
     CDEK_NO_TARIFFS = "CDEK_NO_TARIFFS"
+    CDEK_TARIFF_UNAVAILABLE = "CDEK_TARIFF_UNAVAILABLE"
+    CDEK_OFFICE_UNAVAILABLE = "CDEK_OFFICE_UNAVAILABLE"
     BAD_REQUEST = "BAD_REQUEST"
     UNAUTHORIZED = "UNAUTHORIZED"
     FORBIDDEN = "FORBIDDEN"
@@ -292,6 +294,24 @@ class CdekNoTariffsError(AppError):
         )
 
 
+class CdekTariffUnavailableError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_TARIFF_UNAVAILABLE,
+            "Выбранный тариф СДЭК больше недоступен. Рассчитайте доставку заново.",
+            status_code=422,
+        )
+
+
+class CdekOfficeUnavailableError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_OFFICE_UNAVAILABLE,
+            "Выбранный ПВЗ СДЭК недоступен для указанного города.",
+            status_code=422,
+        )
+
+
 def validation_error(details: Sequence[ErrorDetail] = ()) -> ValidationAppError:
     return ValidationAppError(details)
 
@@ -427,6 +447,21 @@ def _validation_detail(error: Mapping[str, Any]) -> ErrorDetail:
             field="delivery.type",
             code="REQUIRED_CDEK_TYPE",
             message="Для доставки СДЭК выберите способ получения.",
+        ),
+        "cdek_to_city_code_required": ErrorDetail(
+            field="delivery.toCityCode",
+            code="REQUIRED_CDEK_CITY_CODE",
+            message="Для доставки СДЭК выберите город назначения.",
+        ),
+        "cdek_tariff_code_required": ErrorDetail(
+            field="delivery.tariffCode",
+            code="REQUIRED_CDEK_TARIFF",
+            message="Для доставки СДЭК выберите тариф.",
+        ),
+        "cdek_office_required": ErrorDetail(
+            field="delivery.officeCode",
+            code="REQUIRED_CDEK_OFFICE",
+            message="Для доставки до ПВЗ выберите пункт выдачи СДЭК.",
         ),
         "cdek_city_required": ErrorDetail(
             field="delivery.city",
