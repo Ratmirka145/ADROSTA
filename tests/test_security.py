@@ -156,6 +156,34 @@ def test_webhook_rejects_query_secrets_and_invalid_ports(
 
 def test_settings_repr_does_not_expose_secrets(tmp_path: Path) -> None:
     environ = _production_env(tmp_path)
+    environ.update(
+        {
+            "CDEK_CLIENT_ID": "cdek-client-id-not-for-repr",
+            "CDEK_CLIENT_SECRET": "cdek-secret-not-for-repr",
+        }
+    )
     settings = Settings.from_env(environ, load_env_file=False)
     assert environ["APP_HASH_SECRET"] not in repr(settings)
     assert "database-secret" not in repr(settings)
+    assert environ["CDEK_CLIENT_ID"] not in repr(settings)
+    assert environ["CDEK_CLIENT_SECRET"] not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("CDEK_ENV", "staging"), ("CDEK_ORIGIN_MODE", "pickup")],
+)
+def test_invalid_cdek_server_configuration_is_rejected(
+    tmp_path: Path, name: str, value: str
+) -> None:
+    environ = _production_env(tmp_path)
+    environ[name] = value
+    with pytest.raises(ConfigError):
+        Settings.from_env(environ, load_env_file=False)
+
+
+def test_cdek_credentials_must_be_configured_as_a_pair(tmp_path: Path) -> None:
+    environ = _production_env(tmp_path)
+    environ["CDEK_CLIENT_ID"] = "client-without-secret"
+    with pytest.raises(ConfigError, match="configured together"):
+        Settings.from_env(environ, load_env_file=False)

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.cdek import CdekService
 from app.config import Settings
 from app.database import Database
-from app.integrations import WebhookDestination
+from app.integrations import CdekClient, WebhookDestination
 from app.repositories import (
     OrderRepository,
     OutboxRepository,
@@ -23,6 +24,8 @@ class ApplicationContext:
     outbox: OutboxRepository
     rate_limits: RateLimitRepository | None
     order_service: OrderService
+    cdek_service: CdekService
+    cdek_client: CdekClient | None
 
     @classmethod
     def build(cls, settings: Settings) -> "ApplicationContext":
@@ -48,6 +51,20 @@ class ApplicationContext:
             outbox=outbox,
             rate_limits=rate_limits,
         )
+        cdek_client = None
+        if settings.cdek_client_id and settings.cdek_client_secret:
+            cdek_client = CdekClient(
+                client_id=settings.cdek_client_id,
+                client_secret=settings.cdek_client_secret,
+                environment=settings.cdek_env,
+                timeout_seconds=settings.cdek_http_timeout_seconds,
+            )
+        cdek_service = CdekService(
+            client=cdek_client,
+            from_city_code=settings.cdek_from_city_code,
+            origin_mode=settings.cdek_origin_mode,
+            calculate_items=service.calculate_items,
+        )
         return cls(
             settings=settings,
             database=database,
@@ -56,6 +73,8 @@ class ApplicationContext:
             outbox=outbox,
             rate_limits=rate_limits,
             order_service=service,
+            cdek_service=cdek_service,
+            cdek_client=cdek_client,
         )
 
     def outbox_processor(self) -> OutboxProcessor:
@@ -76,4 +95,6 @@ class ApplicationContext:
         )
 
     def close(self) -> None:
+        if self.cdek_client is not None:
+            self.cdek_client.close()
         self.database.close()

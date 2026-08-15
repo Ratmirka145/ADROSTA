@@ -40,6 +40,13 @@ class ErrorCode(str, Enum):
     PRICE_TIER_NOT_FOUND = "PRICE_TIER_NOT_FOUND"
     UPSTREAM_UNAVAILABLE = "UPSTREAM_UNAVAILABLE"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+    CDEK_NOT_CONFIGURED = "CDEK_NOT_CONFIGURED"
+    CDEK_UNAVAILABLE = "CDEK_UNAVAILABLE"
+    CDEK_TIMEOUT = "CDEK_TIMEOUT"
+    CDEK_AUTH_ERROR = "CDEK_AUTH_ERROR"
+    CDEK_BAD_RESPONSE = "CDEK_BAD_RESPONSE"
+    CDEK_LOCATION_NOT_FOUND = "CDEK_LOCATION_NOT_FOUND"
+    CDEK_NO_TARIFFS = "CDEK_NO_TARIFFS"
     BAD_REQUEST = "BAD_REQUEST"
     UNAUTHORIZED = "UNAUTHORIZED"
     FORBIDDEN = "FORBIDDEN"
@@ -219,6 +226,69 @@ class ServiceUnavailableError(AppError):
             ErrorCode.SERVICE_UNAVAILABLE,
             "Сервис временно недоступен. Попробуйте снова позже.",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+class CdekNotConfiguredError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_NOT_CONFIGURED,
+            "Расчёт доставки СДЭК пока не настроен.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+class CdekUnavailableAppError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_UNAVAILABLE,
+            "Сервис СДЭК временно недоступен. Попробуйте снова позже.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+class CdekTimeoutAppError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_TIMEOUT,
+            "Сервис СДЭК не ответил вовремя. Попробуйте снова позже.",
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        )
+
+
+class CdekAuthAppError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_AUTH_ERROR,
+            "Сервис доставки временно недоступен из-за ошибки авторизации.",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class CdekBadResponseAppError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_BAD_RESPONSE,
+            "Сервис СДЭК вернул некорректный ответ.",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class CdekLocationNotFoundError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_LOCATION_NOT_FOUND,
+            "Населённый пункт СДЭК не найден.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class CdekNoTariffsError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CDEK_NO_TARIFFS,
+            "Для выбранного направления и груза нет доступных тарифов СДЭК.",
+            status_code=422,
         )
 
 

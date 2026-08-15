@@ -171,7 +171,7 @@ class OrderService:
                 retry_after=max(1, rate_limit_result.retry_after_seconds)
             )
 
-        calculation = self._calculate(order.items)
+        calculation = self.calculate_items(order.items)
 
         try:
             result = self.orders.create_order(
@@ -214,9 +214,13 @@ class OrderService:
         self, request: CartCalculateRequest
     ) -> OrderCalculationResponse:
         self._validate_runtime_limits(request)
-        return OrderCalculationResponse.from_domain(self._calculate(request.items))
+        return OrderCalculationResponse.from_domain(
+            self.calculate_items(request.items)
+        )
 
-    def _calculate(self, items) -> OrderCalculation:
+    def calculate_items(self, items) -> OrderCalculation:
+        """Calculate trusted product and cargo data for internal consumers."""
+        self._validate_items(items)
         try:
             if self.products.count() == 0:
                 raise CatalogUnavailableError()
@@ -263,10 +267,13 @@ class OrderService:
         return ReadinessResult(ready=ready, checks=checks)
 
     def _validate_runtime_limits(self, order) -> None:
-        if len(order.items) > self.settings.max_order_items:
+        self._validate_items(order.items)
+
+    def _validate_items(self, items) -> None:
+        if len(items) > self.settings.max_order_items:
             raise ValidationAppError()
         total_boxes = 0
-        for item in order.items:
+        for item in items:
             if item.boxes > self.settings.max_boxes_per_item:
                 raise ValidationAppError()
             total_boxes += item.boxes

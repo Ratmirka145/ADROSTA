@@ -61,7 +61,8 @@ flowchart LR
 | `app/domain.py` | Единственный расчёт цены, количества, груза и totals |
 | `app/services.py` | Оркестрация заказа и фоновой доставки |
 | `app/container.py` | Сборка зависимостей приложения и worker |
-| `app/integrations.py` | Универсальный server-to-server webhook без предположений о CRM |
+| `app/integrations.py` | Тонкие HTTP-адаптеры: CDEK API v2 и универсальный webhook |
+| `app/cdek.py` | CDEK application service, package adapter и нормализация тарифов |
 | `app/security.py` | HMAC-отпечатки, проверка idempotency key, доверенные proxy IP |
 | `app/errors.py` | Единый безопасный формат ошибок без отражения введённых данных |
 | `app/observability.py` | Request ID, метаданные запросов и ограничение размера тела без логирования PII |
@@ -87,6 +88,7 @@ flowchart LR
 - логи только с метаданными и request ID, без тела заказа и полных персональных данных;
 - надёжный PostgreSQL outbox с `FOR UPDATE SKIP LOCKED` и отдельный worker;
 - health/readiness, Swagger в development и Docker healthcheck.
+- CDEK API v2: поиск городов и обычных ПВЗ, OAuth и предварительный расчёт списка тарифов.
 
 ### Что намеренно не реализовано без исходных данных
 
@@ -243,7 +245,49 @@ Endpoint выполняет тот же server-side calculation, но не со�
 }
 ```
 
-Backend возвращает только канонические технические единицы: копейки, граммы, миллиметры и мм³. Форматирование в ₽, килограммы или м³ при необходимости выполняет frontend. `productsAmountKopecks` содержит только стоимость товаров. Цена доставки пока не рассчитывается: backend не обращается к API СДЭК и не создаёт фиктивный delivery amount.
+Backend возвращает только канонические технические единицы: копейки, граммы, миллиметры и мм³. Форматирование в ₽, килограммы или м³ при необходимости выполняет frontend. `productsAmountKopecks` содержит только стоимость товаров и не смешивается со стоимостью доставки.
+
+## CDEK integration
+
+Backend обращается к официальному CDEK API v2 только server-to-server. Поддержаны test (`api.edu.cdek.ru`) и production (`api.cdek.ru`) environments; конкретный host выбирается только через `CDEK_ENV`, а frontend не может передать URL, client ID, secret или access token. Реализация сверена с [официальным SDK CDEK-IT](https://github.com/cdek-it/sdk2.0).
+
+Phase 1 поддерживает:
+
+- OAuth `client_credentials` с process-local cache, блокировкой конкурентного refresh и однократным refresh/retry после HTTP 401;
+- поиск городов и получение только обычных ПВЗ, без постаматов;
+- расчёт и возврат всех совместимых тарифов без скрытого выбора самого дешёвого;
+- ограниченный retry временных сетевых ошибок/502/503/504 и безопасные API errors.
+
+Phase 1 не создаёт отправление или заказ в CDEK, не получает трек-номер, не синхронизирует статусы и не вызывает shipment/order endpoints.
+
+### Поиск города и ПВЗ
+
+```bash
+curl --get 'http://127.0.0.1:8000/api/delivery/cdek/cities' \
+  --data-urlencode 'query=Москва' \
+  --data-urlencode 'countryCode=RU'
+
+curl --get 'http://127.0.0.1:8000/api/delivery/cdek/offices' \
+  --data-urlencode 'cityCode=44'
+```
+
+Города и ПВЗ возвращаются в компактном ADROSTA contract, а не как raw CDEK objects. Для checkout `pickup` endpoint офисов возвращает только `type=PVZ`; код выбранного ПВЗ является источником истины.
+
+### Расчёт тарифов
+
+```bash
+curl 'http://127.0.0.1:8000/api/delivery/cdek/quote' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "deliveryType": "pickup",
+    "toCityCode": 44,
+    "items": [{"sku": "opt-san-green", "boxes": 5}]
+  }'
+```
+
+Frontend передаёт только `deliveryType`, город назначения, `sku` и `boxes`. Backend повторно использует единый server-side cart calculator и загружает вес/габариты из PostgreSQL-каталога. Каждая коробка становится отдельным CDEK package: пять коробок создают пять грузовых мест по 10 900 г, а 330 × 200 × 265 мм безопасно преобразуются в требуемые CDEK целые сантиметры как 33 × 20 × 27 см (округление вверх). Город отправления и схема забора (`warehouse` или `door`) берутся только из server config.
+
+Сумма CDEK преобразуется из рублей в integer kopecks через `Decimal`. Для фильтрации применяются официальные `delivery_mode`: `1` дверь→дверь, `2` дверь→склад/ПВЗ, `3` склад→дверь, `4` склад→склад/ПВЗ. Ответ содержит список всех совместимых options; quote ничего не сохраняет в PostgreSQL, не создаёт ADROSTA order и не запускает outbox.
 
 ## Контракт `POST /api/orders`
 
@@ -320,7 +364,7 @@ Backend возвращает только канонические технич�
 }
 ```
 
-На текущем этапе backend только принимает и сохраняет выбранный способ получения. Расчёт тарифа СДЭК и получение списка ПВЗ будут подключены отдельно; обращения к API СДЭК сейчас не выполняются.
+Создание заказа пока сохраняет выбранный способ получения независимо от preview-тарифа. Стоимость доставки из quote не сохраняется навечно и должна быть повторно проверена перед будущим commercial payment/shipment flow.
 
 Для позиции заказа API принимает только `sku` и `boxes`. Поля цены, веса, объёма, размеров и клиентские totals будут отклонены как неизвестные. Общий предел коробок дополнительно задаёт `MAX_TOTAL_BOXES`.
 
@@ -410,6 +454,12 @@ Backend возвращает только канонические технич�
 | `MAX_ORDER_ITEMS` | Максимум разных SKU |
 | `MAX_BOXES_PER_ITEM` | Максимум коробок одной позиции |
 | `MAX_TOTAL_BOXES` | Максимум коробок заказа |
+| `CDEK_ENV` | Только `test` или `production`; выбирает официальный CDEK API v2 host |
+| `CDEK_CLIENT_ID` | Server-side OAuth client/account; задаётся вместе с secret |
+| `CDEK_CLIENT_SECRET` | Server-side OAuth secret; никогда не передаётся во frontend |
+| `CDEK_FROM_CITY_CODE` | Код города отправления ADROSTA в справочнике CDEK |
+| `CDEK_ORIGIN_MODE` | `warehouse` (ADROSTA сдаёт груз) или `door` (забор курьером) |
+| `CDEK_HTTP_TIMEOUT_SECONDS` | Таймаут каждого запроса к CDEK, 0.1–60 секунд |
 | `WEBHOOK_ENABLED` | Включить внешний server-to-server webhook |
 | `ORDER_WEBHOOK_URL` | Реальный URL получателя; в production только HTTPS, без query-токенов |
 | `ORDER_WEBHOOK_TOKEN` | Bearer token получателя; обязателен для production webhook |
@@ -455,6 +505,18 @@ PostgreSQL укажите URL отдельной disposable test database:
 ```powershell
 $env:TEST_DATABASE_URL="postgresql+psycopg://user:password@127.0.0.1:5432/adrosta_test"
 python -m pytest -q -m integration
+```
+
+Обычный набор тестов не обращается к CDEK. Необязательный smoke-тест OAuth,
+поиска города, ПВЗ и tariff list запускается только с test credentials и никогда
+не создаёт отправление:
+
+```powershell
+$env:CDEK_ENV="test"
+$env:CDEK_CLIENT_ID="..."
+$env:CDEK_CLIENT_SECRET="..."
+$env:CDEK_FROM_CITY_CODE="..."
+python -m pytest -q -m cdek_live
 ```
 
 Integration-тест сам выполняет `alembic upgrade head`, очищает только указанную

@@ -24,6 +24,8 @@ from sqlalchemy.exc import ArgumentError
 _TRUE_VALUES: Final = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES: Final = frozenset({"0", "false", "no", "off"})
 _ENVIRONMENTS: Final = frozenset({"development", "test", "production"})
+_CDEK_ENVIRONMENTS: Final = frozenset({"test", "production"})
+_CDEK_ORIGIN_MODES: Final = frozenset({"warehouse", "door"})
 _LOG_LEVELS: Final = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _HOST_RE: Final = re.compile(
     r"^(?:localhost|(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*)$"
@@ -77,6 +79,24 @@ def _parse_int(
     if value < minimum or (maximum is not None and value > maximum):
         upper = f" and at most {maximum}" if maximum is not None else ""
         raise ConfigError(f"{name} must be at least {minimum}{upper}")
+    return value
+
+
+def _parse_optional_int(
+    source: Mapping[str, str],
+    name: str,
+    *,
+    minimum: int = 1,
+) -> int | None:
+    raw = _get(source, name)
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise ConfigError(f"{name} must be at least {minimum}")
     return value
 
 
@@ -232,6 +252,13 @@ class Settings:
     max_boxes_per_item: int
     max_total_boxes: int
 
+    cdek_env: str
+    cdek_client_id: str | None = field(repr=False)
+    cdek_client_secret: str | None = field(repr=False)
+    cdek_from_city_code: int | None
+    cdek_origin_mode: str
+    cdek_http_timeout_seconds: float
+
     webhook_enabled: bool
     webhook_url: str | None
     webhook_token: str | None = field(repr=False)
@@ -312,6 +339,20 @@ class Settings:
         _validate_proxy_ips(proxies)
 
         hash_secret = _get(source, "APP_HASH_SECRET") or None
+        cdek_env = _get(source, "CDEK_ENV", "test").casefold()
+        if cdek_env not in _CDEK_ENVIRONMENTS:
+            raise ConfigError("CDEK_ENV must be test or production")
+        cdek_origin_mode = _get(
+            source, "CDEK_ORIGIN_MODE", "warehouse"
+        ).casefold()
+        if cdek_origin_mode not in _CDEK_ORIGIN_MODES:
+            raise ConfigError("CDEK_ORIGIN_MODE must be warehouse or door")
+        cdek_client_id = _get(source, "CDEK_CLIENT_ID") or None
+        cdek_client_secret = _get(source, "CDEK_CLIENT_SECRET") or None
+        if bool(cdek_client_id) != bool(cdek_client_secret):
+            raise ConfigError(
+                "CDEK_CLIENT_ID and CDEK_CLIENT_SECRET must be configured together"
+            )
         webhook_enabled = _parse_bool(source, "WEBHOOK_ENABLED", False)
         webhook_url = _get(source, "ORDER_WEBHOOK_URL") or None
         webhook_token = _get(source, "ORDER_WEBHOOK_TOKEN") or None
@@ -367,6 +408,20 @@ class Settings:
             ),
             max_total_boxes=_parse_int(
                 source, "MAX_TOTAL_BOXES", 20_000, maximum=2_000_000
+            ),
+            cdek_env=cdek_env,
+            cdek_client_id=cdek_client_id,
+            cdek_client_secret=cdek_client_secret,
+            cdek_from_city_code=_parse_optional_int(
+                source, "CDEK_FROM_CITY_CODE"
+            ),
+            cdek_origin_mode=cdek_origin_mode,
+            cdek_http_timeout_seconds=_parse_float(
+                source,
+                "CDEK_HTTP_TIMEOUT_SECONDS",
+                10.0,
+                minimum=0.1,
+                maximum=60.0,
             ),
             webhook_enabled=webhook_enabled,
             webhook_url=webhook_url,

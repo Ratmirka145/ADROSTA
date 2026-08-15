@@ -279,6 +279,22 @@ class CartCalculateRequest(ApiModel):
         return self
 
 
+class CdekQuoteRequest(ApiModel):
+    delivery_type: CdekDeliveryType
+    to_city_code: Annotated[StrictInt, Field(gt=0)]
+    items: Annotated[list[OrderItem], Field(min_length=1, max_length=100)]
+
+    @model_validator(mode="after")
+    def reject_duplicate_skus(self) -> CdekQuoteRequest:
+        skus = [item.sku for item in self.items]
+        if len(skus) != len(set(skus)):
+            raise PydanticCustomError(
+                "duplicate_sku",
+                "items must not contain duplicate SKU values",
+            )
+        return self
+
+
 class OrderCreateRequest(ApiModel):
     buyer: Buyer
     company: Company | None = None
@@ -354,6 +370,57 @@ class OrderCalculationResponse(ApiModel):
         return cls.model_validate(calculation, from_attributes=True)
 
 
+class CdekCityResponse(ApiModel):
+    code: int
+    city: str
+    region: str | None = None
+    country_code: str
+
+
+class CdekCitiesResponse(ApiModel):
+    items: list[CdekCityResponse]
+
+
+class CdekOfficeResponse(ApiModel):
+    code: str
+    name: str
+    address: str
+    city_code: int
+    postal_code: str | None = None
+    latitude: str | None = None
+    longitude: str | None = None
+    work_time: str | None = None
+    type: Literal["PVZ"] = "PVZ"
+
+
+class CdekOfficesResponse(ApiModel):
+    items: list[CdekOfficeResponse]
+
+
+class CdekCargoResponse(ApiModel):
+    total_boxes: int
+    total_weight_grams: int
+    cargo_places: int
+
+
+class CdekTariffOptionResponse(ApiModel):
+    tariff_code: int
+    tariff_name: str
+    tariff_description: str | None = None
+    delivery_mode: int
+    delivery_amount_kopecks: int
+    period_min_days: int
+    period_max_days: int
+
+
+class CdekQuoteResponse(ApiModel):
+    delivery_type: CdekDeliveryType
+    from_city_code: int
+    to_city_code: int
+    cargo: CdekCargoResponse
+    options: list[CdekTariffOptionResponse]
+
+
 class OrderResponse(ApiModel):
     order_id: UUID
     status: Literal["accepted"] = "accepted"
@@ -385,7 +452,15 @@ __all__ = [
     "ApiModel",
     "Buyer",
     "BuyerType",
+    "CdekCargoResponse",
+    "CdekCitiesResponse",
+    "CdekCityResponse",
     "CdekDeliveryType",
+    "CdekOfficeResponse",
+    "CdekOfficesResponse",
+    "CdekQuoteRequest",
+    "CdekQuoteResponse",
+    "CdekTariffOptionResponse",
     "CartCalculateRequest",
     "CalculatedItemResponse",
     "Company",
