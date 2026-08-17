@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 import re
-from typing import Any, Final
+from typing import Any, Final, cast
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette import status
+from starlette.types import ExceptionHandler
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ class ErrorCode(str, Enum):
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
     CATALOG_UNAVAILABLE = "CATALOG_UNAVAILABLE"
     PRICE_TIER_NOT_FOUND = "PRICE_TIER_NOT_FOUND"
+    INVOICE_NOT_CONFIGURED = "INVOICE_NOT_CONFIGURED"
+    INVOICE_GENERATION_FAILED = "INVOICE_GENERATION_FAILED"
     UPSTREAM_UNAVAILABLE = "UPSTREAM_UNAVAILABLE"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
     CDEK_NOT_CONFIGURED = "CDEK_NOT_CONFIGURED"
@@ -49,6 +52,7 @@ class ErrorCode(str, Enum):
     CDEK_NO_TARIFFS = "CDEK_NO_TARIFFS"
     CDEK_TARIFF_UNAVAILABLE = "CDEK_TARIFF_UNAVAILABLE"
     CDEK_OFFICE_UNAVAILABLE = "CDEK_OFFICE_UNAVAILABLE"
+    ORDER_NOT_AVAILABLE = "ORDER_NOT_AVAILABLE"
     BAD_REQUEST = "BAD_REQUEST"
     UNAUTHORIZED = "UNAUTHORIZED"
     FORBIDDEN = "FORBIDDEN"
@@ -213,6 +217,24 @@ class PriceTierNotFoundError(AppError):
         )
 
 
+class InvoiceNotConfiguredError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.INVOICE_NOT_CONFIGURED,
+            "Формирование счёта временно недоступно: не настроены реквизиты продавца.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+class InvoiceGenerationFailedError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.INVOICE_GENERATION_FAILED,
+            "Не удалось сформировать счёт. Попробуйте снова позже.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 class UpstreamUnavailableError(AppError):
     def __init__(self) -> None:
         super().__init__(
@@ -309,6 +331,15 @@ class CdekOfficeUnavailableError(AppError):
             ErrorCode.CDEK_OFFICE_UNAVAILABLE,
             "Выбранный ПВЗ СДЭК недоступен для указанного города.",
             status_code=422,
+        )
+
+
+class OrderNotAvailableError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.ORDER_NOT_AVAILABLE,
+            "Заказ недоступен.",
+            status_code=status.HTTP_404_NOT_FOUND,
         )
 
 
@@ -678,9 +709,15 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 def install_error_handlers(app: FastAPI) -> None:
     """Install the unified error contract on a FastAPI application."""
 
-    app.add_exception_handler(AppError, app_error_handler)
-    app.add_exception_handler(RequestValidationError, request_validation_error_handler)
-    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(AppError, cast(ExceptionHandler, app_error_handler))
+    app.add_exception_handler(
+        RequestValidationError,
+        cast(ExceptionHandler, request_validation_error_handler),
+    )
+    app.add_exception_handler(
+        HTTPException,
+        cast(ExceptionHandler, http_exception_handler),
+    )
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
 
@@ -693,13 +730,25 @@ def register_exception_handlers(app: FastAPI) -> None:
 __all__ = [
     "AppError",
     "CatalogUnavailableError",
+    "CdekAuthAppError",
+    "CdekBadResponseAppError",
+    "CdekLocationNotFoundError",
+    "CdekNoTariffsError",
+    "CdekNotConfiguredError",
+    "CdekOfficeUnavailableError",
+    "CdekTariffUnavailableError",
+    "CdekTimeoutAppError",
+    "CdekUnavailableAppError",
     "DuplicateSkuError",
     "DuplicateOrderError",
     "ErrorCode",
     "ErrorDetail",
     "IdempotencyConflictError",
     "IdempotencyKeyRequiredError",
+    "InvoiceGenerationFailedError",
+    "InvoiceNotConfiguredError",
     "OrderInProgressError",
+    "OrderNotAvailableError",
     "PayloadTooLargeError",
     "PriceTierNotFoundError",
     "RateLimitError",

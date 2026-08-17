@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
+import hashlib
 import os
 import subprocess
 from threading import Barrier
@@ -17,9 +18,15 @@ from app.database import Database
 from app.domain import calculate_order
 from app.main import create_app
 from app.models import (
+    CustomerSessionModel,
+    CustomerSessionOrderModel,
     IdempotencyRecordModel,
+    InvoiceCounterModel,
+    InvoiceItemModel,
+    InvoiceModel,
     OrderItemModel,
     OrderModel,
+    OrderCounterModel,
     OutboxModel,
     ProductModel,
     ProductPriceTierModel,
@@ -87,6 +94,16 @@ def _settings() -> Settings:
             "ORDER_WEBHOOK_URL": "http://127.0.0.1:9/orders",
             "OUTBOX_ENABLED": "true",
             "ALLOW_STORE_ONLY": "true",
+            "SELLER_LEGAL_NAME": "ООО АДРОСТА ТЕСТ",
+            "SELLER_INN": "7707083893",
+            "SELLER_KPP": "773601001",
+            "SELLER_LEGAL_ADDRESS": "г. Москва, тестовый адрес, д. 10",
+            "SELLER_BANK_NAME": "Тестовый банк",
+            "SELLER_BIK": "044525000",
+            "SELLER_CHECKING_ACCOUNT": "40702810000000000001",
+            "SELLER_CORRESPONDENT_ACCOUNT": "30101810000000000000",
+            "INVOICE_TAX_TEXT": "Без НДС (тест)",
+            "INVOICE_PAYMENT_PURPOSE_TEMPLATE": "Оплата по счёту {invoice_number}",
         },
         load_env_file=False,
     )
@@ -106,11 +123,17 @@ def _reset_database() -> None:
             for model in (
                 OutboxModel,
                 IdempotencyRecordModel,
+                CustomerSessionOrderModel,
+                CustomerSessionModel,
+                InvoiceItemModel,
+                InvoiceModel,
                 OrderItemModel,
                 RateLimitWindowModel,
                 ProductPriceTierModel,
                 OrderModel,
                 ProductModel,
+                InvoiceCounterModel,
+                OrderCounterModel,
             ):
                 session.execute(delete(model))
     finally:
@@ -160,10 +183,16 @@ def test_postgresql_migration_seed_cart_order_and_outbox(postgres_app) -> None:
         "products",
         "product_price_tiers",
         "orders",
+        "order_counters",
         "order_items",
         "idempotency_records",
         "rate_limit_windows",
         "outbox",
+        "invoice_counters",
+        "invoices",
+        "invoice_items",
+        "customer_sessions",
+        "customer_session_orders",
     }
     with context.database.session() as session:
         assert session.scalar(select(func.count()).select_from(ProductModel)) == 2
@@ -202,6 +231,15 @@ def test_postgresql_migration_seed_cart_order_and_outbox(postgres_app) -> None:
         "totalVolumeMm3": 87_450_000,
     }
     assert order.status_code == 201
+    invoice = context.invoices.get_for_order(order.json()["orderId"])
+    assert invoice is not None
+    assert invoice.status == "generated"
+    assert invoice.products_amount_kopecks == 1_450_000
+    assert invoice.delivery_amount_kopecks == 0
+    assert invoice.grand_total_kopecks == 1_450_000
+    assert invoice.pdf_bytes is not None
+    assert invoice.pdf_sha256 == hashlib.sha256(invoice.pdf_bytes).hexdigest()
+    assert [(item.quantity, item.unit) for item in invoice.items] == [(50, "шт.")]
     message = context.outbox.get_for_order(order.json()["orderId"])
     assert message is not None
     assert message.status == "pending"
@@ -239,6 +277,15 @@ def test_postgresql_persists_verified_cdek_delivery_snapshot(postgres_app) -> No
     assert response.json()["totals"]["productsAmountKopecks"] == 1_450_000
     assert response.json()["totals"]["deliveryAmountKopecks"] == 123_450
     assert response.json()["totals"]["grandTotalKopecks"] == 1_573_450
+    invoice = context.invoices.get_for_order(response.json()["orderId"])
+    assert invoice is not None
+    assert invoice.products_amount_kopecks == 1_450_000
+    assert invoice.delivery_amount_kopecks == 123_450
+    assert invoice.grand_total_kopecks == 1_573_450
+    delivery_lines = [item for item in invoice.items if item.line_type == "delivery"]
+    assert len(delivery_lines) == 1
+    assert delivery_lines[0].name == "Доставка СДЭК"
+    assert delivery_lines[0].line_amount_kopecks == 123_450
     with context.database.session() as session:
         order = session.get(OrderModel, response.json()["orderId"])
         assert order is not None
@@ -258,6 +305,50 @@ def test_postgresql_persists_verified_cdek_delivery_snapshot(postgres_app) -> No
     assert webhook_snapshot is not None
     assert webhook_snapshot.as_dict()["delivery"]["tariffCode"] == 136
     assert webhook_snapshot.as_dict()["totals"]["grandTotalKopecks"] == 1_573_450
+
+
+def test_postgresql_customer_session_hash_grant_order_and_pdf(postgres_app) -> None:
+    context = postgres_app.state.context
+    with TestClient(postgres_app) as client:
+        created = client.post(
+            "/api/orders",
+            headers={"Idempotency-Key": "postgres-customer-key-0001"},
+            json={
+                "buyer": {
+                    "type": "individual",
+                    "contactName": "Иван Петров",
+                    "phone": "8 (999) 123-45-67",
+                    "email": "buyer@example.com",
+                },
+                "delivery": {"method": "self_pickup"},
+                "items": [{"sku": "opt-san-green", "boxes": 5}],
+            },
+        )
+        token = client.cookies.get("adrosta_customer_session")
+        assert token is not None
+        order_number = created.json()["orderNumber"]
+        customer_order = client.get(f"/api/customer/orders/{order_number}")
+        pdf = client.get(f"/api/customer/orders/{order_number}/invoice.pdf")
+
+    assert created.status_code == 201
+    assert customer_order.status_code == 200
+    assert customer_order.json()["orderNumber"] == order_number
+    assert pdf.status_code == 200
+    assert pdf.content.startswith(b"%PDF")
+    with context.database.session() as session:
+        stored_session = session.scalar(select(CustomerSessionModel))
+        stored_order = session.scalar(
+            select(OrderModel).where(OrderModel.order_number == order_number)
+        )
+        assert stored_session is not None
+        assert stored_order is not None
+        assert stored_session.token_hash == hashlib.sha256(token.encode()).hexdigest()
+        assert stored_session.token_hash != token
+        grant = session.get(
+            CustomerSessionOrderModel,
+            (stored_session.id, stored_order.id),
+        )
+        assert grant is not None
 
 
 def test_postgresql_concurrent_idempotency_creates_one_order(postgres_app) -> None:
@@ -295,6 +386,48 @@ def test_postgresql_concurrent_idempotency_creates_one_order(postgres_app) -> No
             == 1
         )
         assert session.scalar(select(func.count()).select_from(OutboxModel)) == 1
+
+
+def test_postgresql_concurrent_orders_get_unique_invoice_numbers(postgres_app) -> None:
+    context = postgres_app.state.context
+    payload = {
+        "buyer": {
+            "type": "individual",
+            "contactName": "Иван Петров",
+            "phone": "8 (999) 123-45-67",
+            "email": "buyer@example.com",
+        },
+        "delivery": {"method": "self_pickup"},
+        "items": [{"sku": "opt-san-green", "boxes": 5}],
+    }
+    barrier = Barrier(2)
+
+    def create_order(number: int):
+        barrier.wait()
+        with TestClient(postgres_app) as client:
+            return client.post(
+                "/api/orders",
+                headers={
+                    "Idempotency-Key": f"concurrent-invoice-key-{number:04d}"
+                },
+                json={**payload, "comment": f"parallel invoice {number}"},
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(create_order, (1, 2)))
+
+    assert [response.status_code for response in responses] == [201, 201]
+    with context.database.session() as session:
+        invoices = session.scalars(
+            select(InvoiceModel).order_by(InvoiceModel.invoice_number)
+        ).all()
+        assert len(invoices) == 2
+        assert len({invoice.order_id for invoice in invoices}) == 2
+        assert [invoice.invoice_number for invoice in invoices] == [
+            f"INV-{invoices[0].invoice_number[4:8]}-000001",
+            f"INV-{invoices[0].invoice_number[4:8]}-000002",
+        ]
+        assert all(invoice.status == "generated" for invoice in invoices)
 
 
 def test_postgresql_concurrent_outbox_claims_do_not_overlap(postgres_app) -> None:

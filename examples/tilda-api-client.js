@@ -370,7 +370,9 @@
         return global.fetch(endpoint, {
           method: "POST",
           mode: "cors",
-          credentials: "omit",
+          // Customer session is an HttpOnly cookie issued by the API. JavaScript
+          // never reads it; the browser sends it only for credentialed requests.
+          credentials: "include",
           cache: "no-store",
           redirect: "error",
           referrerPolicy: "strict-origin-when-cross-origin",

@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
+import secrets
 import time
 import uuid
-from dataclasses import dataclass, replace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
 
 from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -27,17 +30,27 @@ from app.domain import (
     Product as DomainProduct,
 )
 from app.models import (
+    CustomerSessionModel,
+    CustomerSessionOrderModel,
     IdempotencyRecordModel,
+    InvoiceCounterModel,
+    InvoiceItemModel,
+    InvoiceModel,
     OrderItemModel,
     OrderModel,
+    OrderCounterModel,
     OutboxModel,
     ProductModel,
     ProductPriceTierModel,
     RateLimitWindowModel,
 )
+from app.invoice import InvoiceDraft, InvoiceItemDraft, InvoiceSnapshot
 
 
 _MAX_BIGINT = 9_223_372_036_854_775_807
+_CUSTOMER_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+_ORDER_NUMBER_RE = re.compile(r"^AD-\d{4}-\d{6}$")
+_CUSTOMER_SESSION_TOUCH_INTERVAL_SECONDS = 3_600
 _PRODUCT_UPDATE_FIELDS = {
     "name",
     "units_per_box",
@@ -190,6 +203,7 @@ class OrderItemSnapshot:
 @dataclass(frozen=True)
 class OrderResponse:
     order_id: str
+    order_number: str
     status: str
     created_at: int
     total_boxes: int
@@ -218,7 +232,7 @@ class OrderResponse:
     items: Tuple[OrderItemSnapshot, ...]
 
     def as_dict(self) -> dict:
-        delivery = {"method": self.delivery_method}
+        delivery: dict[str, object] = {"method": self.delivery_method}
         for name, value in (
             ("type", self.delivery_type),
             ("toCityCode", self.cdek_to_city_code),
@@ -239,6 +253,7 @@ class OrderResponse:
                 delivery[name] = value
         return {
             "orderId": self.order_id,
+            "orderNumber": self.order_number,
             "status": self.status,
             "createdAt": self.created_at,
             "totals": {
@@ -262,6 +277,7 @@ class CreateOrderResult:
     created: bool
     replayed: bool
     duplicate: bool
+    customer_session_issue: "CustomerSessionIssue | None" = None
 
     @property
     def disposition(self) -> str:
@@ -270,6 +286,62 @@ class CreateOrderResult:
         if self.replayed:
             return "replayed"
         return "duplicate"
+
+
+@dataclass(frozen=True)
+class CustomerSessionIssue:
+    token: str = field(repr=False)
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class CustomerOrderItemRecord:
+    sku: str
+    name: str
+    quantity: int
+    unit: str
+    line_amount_kopecks: int
+
+
+@dataclass(frozen=True)
+class CustomerOrderRecord:
+    order_number: str
+    status: str
+    created_at: int
+    products_amount_kopecks: int
+    delivery_amount_kopecks: int
+    grand_total_kopecks: int
+    delivery_method: str
+    delivery_type: str | None
+    cdek_tariff_name: str | None
+    delivery_city: str | None
+    delivery_office_code: str | None
+    cdek_period_min_days: int | None
+    cdek_period_max_days: int | None
+    invoice_number: str | None
+    invoice_issued_at: int | None
+    invoice_pdf_available: bool
+    items: tuple[CustomerOrderItemRecord, ...]
+
+
+@dataclass(frozen=True)
+class CustomerInvoicePdfRecord:
+    order_number: str
+    invoice_number: str
+    pdf_bytes: bytes
+    pdf_sha256: str
+
+
+@dataclass(frozen=True)
+class CustomerOrderLookup:
+    session_valid: bool
+    order: CustomerOrderRecord | None = None
+
+
+@dataclass(frozen=True)
+class CustomerInvoiceLookup:
+    session_valid: bool
+    invoice: CustomerInvoicePdfRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -331,7 +403,7 @@ class WebhookOrder:
                 "kpp": self.company_kpp,
                 "legalAddress": self.company_legal_address,
             }
-        delivery = {"method": self.delivery_method}
+        delivery: dict[str, object] = {"method": self.delivery_method}
         for name, value in (
             ("type", self.delivery_type),
             ("toCityCode", self.cdek_to_city_code),
@@ -531,6 +603,7 @@ class ProductRepository:
         timestamp = _now(now)
         values = self._values(product, timestamp)
         with self.database.transaction() as session:
+            statement: Any
             if self.database.is_postgresql:
                 statement = postgresql_insert(ProductModel).values(**values)
             else:
@@ -606,7 +679,7 @@ class ProductRepository:
             current = self._from_model(row)
             if not changes:
                 return current
-            candidate = self._validate(replace(current, **changes))
+            candidate = self._validate(replace(current, **cast(Any, changes)))
             for name in _PRODUCT_UPDATE_FIELDS:
                 setattr(row, name, getattr(candidate, name))
             row.updated_at = _now(now)
@@ -620,7 +693,7 @@ class ProductRepository:
         sku = _required_text(sku, "sku")
         with self.database.transaction() as session:
             result = session.execute(delete(ProductModel).where(ProductModel.sku == sku))
-            return result.rowcount == 1
+            return int(getattr(result, "rowcount", 0)) == 1
 
     def replace_price_tiers(
         self,
@@ -686,19 +759,26 @@ class ProductRepository:
                     price_per_unit_kopecks=tier.price_per_unit_kopecks,
                 )
             )
-        return {
-            row.sku: DomainProduct(
+        catalog: Dict[str, DomainProduct] = {}
+        for row in products:
+            length_mm = row.box_length_mm
+            width_mm = row.box_width_mm
+            height_mm = row.box_height_mm
+            if length_mm is None or width_mm is None or height_mm is None:
+                raise ProductCatalogError(
+                    f"Product dimensions are incomplete for SKU: {row.sku}"
+                )
+            catalog[row.sku] = DomainProduct(
                 sku=row.sku,
                 name=row.name,
                 units_per_box=row.units_per_box,
                 weight_grams=row.box_weight_grams,
-                length_mm=row.box_length_mm,
-                width_mm=row.box_width_mm,
-                height_mm=row.box_height_mm,
+                length_mm=length_mm,
+                width_mm=width_mm,
+                height_mm=height_mm,
                 price_tiers=tuple(tiers_by_sku[row.sku]),
             )
-            for row in products
-        }
+        return catalog
 
 
 class RateLimitRepository:
@@ -740,6 +820,7 @@ class RateLimitRepository:
                     RateLimitWindowModel.window_start < window_start - window_seconds
                 )
             )
+            statement: Any
             if self.database.is_postgresql:
                 statement = postgresql_insert(RateLimitWindowModel).values(**values)
             else:
@@ -769,7 +850,492 @@ class RateLimitRepository:
                     RateLimitWindowModel.window_start < int(before)
                 )
             )
-            return result.rowcount
+            return int(getattr(result, "rowcount", 0))
+
+
+class InvoiceRepository:
+    """Persist immutable invoice snapshots and generated PDF documents."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def _next_number(self, session: Session, *, issued_at: int) -> str:
+        year = datetime.fromtimestamp(issued_at, UTC).year
+        values = {"year": year, "last_value": 1}
+        statement: Any
+        if self.database.is_postgresql:
+            statement = postgresql_insert(InvoiceCounterModel).values(**values)
+        else:
+            statement = sqlite_insert(InvoiceCounterModel).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["year"],
+            set_={"last_value": InvoiceCounterModel.last_value + 1},
+        ).returning(InvoiceCounterModel.last_value)
+        number = int(session.scalar(statement))
+        return f"INV-{year}-{number:06d}"
+
+    def create_pending(
+        self,
+        session: Session,
+        *,
+        order_id: str,
+        draft: InvoiceDraft,
+        issued_at: int,
+    ) -> InvoiceSnapshot:
+        invoice_number = self._next_number(session, issued_at=issued_at)
+        snapshot = draft.materialize(
+            invoice_id=str(uuid.uuid4()),
+            order_id=order_id,
+            invoice_number=invoice_number,
+            issued_at=issued_at,
+        )
+        if sum(
+            item.line_amount_kopecks
+            for item in snapshot.items
+            if item.line_type == "product"
+        ) != snapshot.products_amount_kopecks:
+            raise InvalidOrderError("invoice product lines do not match order total")
+        if sum(
+            item.line_amount_kopecks
+            for item in snapshot.items
+            if item.line_type == "delivery"
+        ) != snapshot.delivery_amount_kopecks:
+            raise InvalidOrderError("invoice delivery lines do not match order total")
+        session.add(
+            InvoiceModel(
+                id=snapshot.id,
+                order_id=order_id,
+                invoice_number=invoice_number,
+                issued_at=issued_at,
+                status="pending",
+                template_version=snapshot.template_version,
+                seller_legal_name=snapshot.seller_legal_name,
+                seller_inn=snapshot.seller_inn,
+                seller_kpp=snapshot.seller_kpp,
+                seller_legal_address=snapshot.seller_legal_address,
+                seller_bank_name=snapshot.seller_bank_name,
+                seller_bik=snapshot.seller_bik,
+                seller_checking_account=snapshot.seller_checking_account,
+                seller_correspondent_account=snapshot.seller_correspondent_account,
+                seller_phone=snapshot.seller_phone,
+                seller_email=snapshot.seller_email,
+                buyer_name=snapshot.buyer_name,
+                buyer_inn=snapshot.buyer_inn,
+                buyer_kpp=snapshot.buyer_kpp,
+                buyer_legal_address=snapshot.buyer_legal_address,
+                products_amount_kopecks=snapshot.products_amount_kopecks,
+                delivery_amount_kopecks=snapshot.delivery_amount_kopecks,
+                grand_total_kopecks=snapshot.grand_total_kopecks,
+                tax_text=snapshot.tax_text,
+                payment_purpose=snapshot.payment_purpose,
+                pdf_content=None,
+                pdf_sha256=None,
+                generated_at=None,
+                created_at=issued_at,
+                updated_at=issued_at,
+            )
+        )
+        session.flush()
+        session.add_all(
+            InvoiceItemModel(
+                invoice_id=snapshot.id,
+                line_number=item.line_number,
+                line_type=item.line_type,
+                sku=item.sku,
+                name=item.name,
+                quantity=item.quantity,
+                unit=item.unit,
+                unit_price_kopecks=item.unit_price_kopecks,
+                line_amount_kopecks=item.line_amount_kopecks,
+            )
+            for item in snapshot.items
+        )
+        return snapshot
+
+    @staticmethod
+    def _snapshot(session: Session, row: InvoiceModel) -> InvoiceSnapshot:
+        item_rows = session.scalars(
+            select(InvoiceItemModel)
+            .where(InvoiceItemModel.invoice_id == row.id)
+            .order_by(InvoiceItemModel.line_number)
+        ).all()
+        items = tuple(
+            InvoiceItemDraft(
+                line_number=item.line_number,
+                line_type=item.line_type,  # type: ignore[arg-type]
+                sku=item.sku,
+                name=item.name,
+                quantity=item.quantity,
+                unit=item.unit,
+                unit_price_kopecks=item.unit_price_kopecks,
+                line_amount_kopecks=item.line_amount_kopecks,
+            )
+            for item in item_rows
+        )
+        return InvoiceSnapshot(
+            id=row.id,
+            order_id=row.order_id,
+            invoice_number=row.invoice_number,
+            issued_at=row.issued_at,
+            status=row.status,  # type: ignore[arg-type]
+            template_version=row.template_version,
+            seller_legal_name=row.seller_legal_name,
+            seller_inn=row.seller_inn,
+            seller_kpp=row.seller_kpp,
+            seller_legal_address=row.seller_legal_address,
+            seller_bank_name=row.seller_bank_name,
+            seller_bik=row.seller_bik,
+            seller_checking_account=row.seller_checking_account,
+            seller_correspondent_account=row.seller_correspondent_account,
+            seller_phone=row.seller_phone,
+            seller_email=row.seller_email,
+            buyer_name=row.buyer_name,
+            buyer_inn=row.buyer_inn,
+            buyer_kpp=row.buyer_kpp,
+            buyer_legal_address=row.buyer_legal_address,
+            products_amount_kopecks=row.products_amount_kopecks,
+            delivery_amount_kopecks=row.delivery_amount_kopecks,
+            grand_total_kopecks=row.grand_total_kopecks,
+            tax_text=row.tax_text,
+            payment_purpose=row.payment_purpose,
+            pdf_bytes=bytes(row.pdf_content) if row.pdf_content is not None else None,
+            pdf_sha256=row.pdf_sha256,
+            generated_at=row.generated_at,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            items=items,
+        )
+
+    def get_for_order(self, order_id: str) -> InvoiceSnapshot | None:
+        order_id = _required_text(order_id, "order_id")
+        with self.database.session() as session:
+            row = session.scalar(
+                select(InvoiceModel).where(InvoiceModel.order_id == order_id)
+            )
+            return self._snapshot(session, row) if row is not None else None
+
+    def store_generated(
+        self,
+        invoice_id: str,
+        *,
+        pdf_bytes: bytes,
+        pdf_sha256: str,
+        generated_at: int,
+    ) -> InvoiceSnapshot:
+        if not pdf_bytes.startswith(b"%PDF"):
+            raise ValueError("invalid PDF document")
+        expected_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+        if not hmac.compare_digest(pdf_sha256, expected_sha256):
+            raise ValueError("PDF SHA-256 does not match document bytes")
+        with self.database.transaction() as session:
+            row = session.scalar(
+                select(InvoiceModel)
+                .where(InvoiceModel.id == invoice_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise RepositoryError("invoice not found")
+            if row.status == "generated":
+                return self._snapshot(session, row)
+            row.status = "generated"
+            row.pdf_content = bytes(pdf_bytes)
+            row.pdf_sha256 = _required_text(pdf_sha256, "pdf_sha256")
+            row.generated_at = int(generated_at)
+            row.updated_at = int(generated_at)
+            session.flush()
+            return self._snapshot(session, row)
+
+    def mark_failed(self, invoice_id: str, *, now: int) -> None:
+        with self.database.transaction() as session:
+            session.execute(
+                update(InvoiceModel)
+                .where(
+                    InvoiceModel.id == invoice_id,
+                    InvoiceModel.status != "generated",
+                )
+                .values(status="failed", updated_at=int(now))
+            )
+
+    def count(self) -> int:
+        with self.database.session() as session:
+            return int(session.scalar(select(func.count()).select_from(InvoiceModel)) or 0)
+
+
+class CustomerSessionRepository:
+    """Store only token hashes and authorize access through explicit order grants."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    @staticmethod
+    def token_hash(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _valid_token_shape(token: str | None) -> bool:
+        return isinstance(token, str) and _CUSTOMER_TOKEN_RE.fullmatch(token) is not None
+
+    def _active_session(
+        self,
+        session: Session,
+        token: str | None,
+        *,
+        now: int,
+        touch: bool,
+    ) -> CustomerSessionModel | None:
+        if not self._valid_token_shape(token):
+            return None
+        assert token is not None
+        digest = self.token_hash(token)
+        row = session.scalar(
+            select(CustomerSessionModel).where(
+                CustomerSessionModel.token_hash == digest
+            )
+        )
+        if row is None or not hmac.compare_digest(row.token_hash, digest):
+            return None
+        if row.revoked_at is not None or row.expires_at <= now:
+            return None
+        if (
+            touch
+            and row.last_used_at
+            <= now - _CUSTOMER_SESSION_TOUCH_INTERVAL_SECONDS
+        ):
+            row.last_used_at = now
+        return row
+
+    def attach_order(
+        self,
+        session: Session,
+        *,
+        order_id: str,
+        token: str | None,
+        ttl_seconds: int,
+        now: int,
+    ) -> CustomerSessionIssue | None:
+        """Attach a new order in the caller's transaction.
+
+        A valid existing token is reused without returning it. Invalid or absent
+        tokens are replaced by a fresh 256-bit token which exists only in memory.
+        """
+
+        ttl_seconds = _positive_integer(ttl_seconds, "customer_session_ttl_seconds")
+        session_row = self._active_session(
+            session,
+            token,
+            now=now,
+            touch=False,
+        )
+        issue: CustomerSessionIssue | None = None
+        if session_row is None:
+            raw_token = secrets.token_urlsafe(32)
+            expires_at = now + ttl_seconds
+            session_row = CustomerSessionModel(
+                id=str(uuid.uuid4()),
+                token_hash=self.token_hash(raw_token),
+                created_at=now,
+                expires_at=expires_at,
+                last_used_at=now,
+                revoked_at=None,
+            )
+            session.add(session_row)
+            session.flush()
+            issue = CustomerSessionIssue(
+                token=raw_token,
+                expires_at=expires_at,
+            )
+        else:
+            session_row.last_used_at = now
+
+        session.add(
+            CustomerSessionOrderModel(
+                session_id=session_row.id,
+                order_id=_required_text(order_id, "order_id"),
+                created_at=now,
+            )
+        )
+        return issue
+
+    def has_order_access(
+        self,
+        token: str | None,
+        order_id: str,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        timestamp = _now(now)
+        with self.database.transaction() as session:
+            session_row = self._active_session(
+                session,
+                token,
+                now=timestamp,
+                touch=True,
+            )
+            if session_row is None:
+                return False
+            return (
+                session.get(
+                    CustomerSessionOrderModel,
+                    (session_row.id, _required_text(order_id, "order_id")),
+                )
+                is not None
+            )
+
+    def lookup_order(
+        self,
+        token: str | None,
+        order_number: str,
+        *,
+        now: int | None = None,
+    ) -> CustomerOrderLookup:
+        timestamp = _now(now)
+        if _ORDER_NUMBER_RE.fullmatch(order_number) is None:
+            return CustomerOrderLookup(session_valid=self._valid_token_shape(token))
+        with self.database.transaction() as session:
+            session_row = self._active_session(
+                session,
+                token,
+                now=timestamp,
+                touch=True,
+            )
+            if session_row is None:
+                return CustomerOrderLookup(session_valid=False)
+            order = session.scalar(
+                select(OrderModel)
+                .join(
+                    CustomerSessionOrderModel,
+                    CustomerSessionOrderModel.order_id == OrderModel.id,
+                )
+                .where(
+                    CustomerSessionOrderModel.session_id == session_row.id,
+                    OrderModel.order_number == order_number,
+                )
+            )
+            if order is None:
+                return CustomerOrderLookup(session_valid=True)
+            invoice = session.scalar(
+                select(InvoiceModel).where(InvoiceModel.order_id == order.id)
+            )
+            item_rows = session.scalars(
+                select(OrderItemModel)
+                .where(OrderItemModel.order_id == order.id)
+                .order_by(OrderItemModel.line_number)
+            ).all()
+            return CustomerOrderLookup(
+                session_valid=True,
+                order=CustomerOrderRecord(
+                    order_number=order.order_number,
+                    status=order.status,
+                    created_at=order.created_at,
+                    products_amount_kopecks=order.products_amount_kopecks,
+                    delivery_amount_kopecks=order.delivery_amount_kopecks,
+                    grand_total_kopecks=order.grand_total_kopecks,
+                    delivery_method=order.delivery_method,
+                    delivery_type=order.delivery_type,
+                    cdek_tariff_name=order.cdek_tariff_name,
+                    delivery_city=order.delivery_city,
+                    delivery_office_code=order.delivery_office_code,
+                    cdek_period_min_days=order.cdek_period_min_days,
+                    cdek_period_max_days=order.cdek_period_max_days,
+                    invoice_number=invoice.invoice_number if invoice else None,
+                    invoice_issued_at=invoice.issued_at if invoice else None,
+                    invoice_pdf_available=(
+                        invoice is not None
+                        and invoice.status == "generated"
+                        and invoice.pdf_content is not None
+                        and invoice.pdf_sha256 is not None
+                    ),
+                    items=tuple(
+                        CustomerOrderItemRecord(
+                            sku=item.sku,
+                            name=item.product_name,
+                            quantity=item.units,
+                            unit="шт.",
+                            line_amount_kopecks=item.line_amount_kopecks,
+                        )
+                        for item in item_rows
+                    ),
+                ),
+            )
+
+    def lookup_invoice_pdf(
+        self,
+        token: str | None,
+        order_number: str,
+        *,
+        now: int | None = None,
+    ) -> CustomerInvoiceLookup:
+        timestamp = _now(now)
+        if _ORDER_NUMBER_RE.fullmatch(order_number) is None:
+            return CustomerInvoiceLookup(session_valid=self._valid_token_shape(token))
+        with self.database.transaction() as session:
+            session_row = self._active_session(
+                session,
+                token,
+                now=timestamp,
+                touch=True,
+            )
+            if session_row is None:
+                return CustomerInvoiceLookup(session_valid=False)
+            row = session.execute(
+                select(OrderModel.order_number, InvoiceModel)
+                .join(
+                    CustomerSessionOrderModel,
+                    CustomerSessionOrderModel.order_id == OrderModel.id,
+                )
+                .join(InvoiceModel, InvoiceModel.order_id == OrderModel.id)
+                .where(
+                    CustomerSessionOrderModel.session_id == session_row.id,
+                    OrderModel.order_number == order_number,
+                    InvoiceModel.status == "generated",
+                )
+            ).one_or_none()
+            if row is None:
+                return CustomerInvoiceLookup(session_valid=True)
+            stored_order_number, invoice = row
+            if invoice.pdf_content is None or invoice.pdf_sha256 is None:
+                return CustomerInvoiceLookup(session_valid=True)
+            return CustomerInvoiceLookup(
+                session_valid=True,
+                invoice=CustomerInvoicePdfRecord(
+                    order_number=stored_order_number,
+                    invoice_number=invoice.invoice_number,
+                    pdf_bytes=bytes(invoice.pdf_content),
+                    pdf_sha256=invoice.pdf_sha256,
+                ),
+            )
+
+    def revoke(self, token: str | None, *, now: int | None = None) -> bool:
+        timestamp = _now(now)
+        with self.database.transaction() as session:
+            session_row = self._active_session(
+                session,
+                token,
+                now=timestamp,
+                touch=False,
+            )
+            if session_row is None:
+                return False
+            session_row.revoked_at = timestamp
+            return True
+
+    def count(self) -> int:
+        with self.database.session() as session:
+            return int(
+                session.scalar(
+                    select(func.count()).select_from(CustomerSessionModel)
+                )
+                or 0
+            )
+
+    def grant_count(self) -> int:
+        with self.database.session() as session:
+            return int(
+                session.scalar(
+                    select(func.count()).select_from(CustomerSessionOrderModel)
+                )
+                or 0
+            )
 
 
 class OrderRepository:
@@ -782,6 +1348,8 @@ class OrderRepository:
         *,
         idempotency_ttl_seconds: int = 86_400,
         duplicate_window_seconds: int = 300,
+        invoices: InvoiceRepository | None = None,
+        customer_sessions: CustomerSessionRepository | None = None,
     ) -> None:
         self.database = database
         self._secret = _secret_bytes(hmac_secret)
@@ -791,6 +1359,25 @@ class OrderRepository:
         self.duplicate_window_seconds = _positive_integer(
             duplicate_window_seconds, "duplicate_window_seconds"
         )
+        self.invoices = invoices
+        self.customer_sessions = customer_sessions
+
+    def _next_order_number(self, session: Session, *, created_at: int) -> str:
+        year = datetime.fromtimestamp(created_at, UTC).year
+        values = {"year": year, "last_value": 1}
+        statement: Any
+        if self.database.is_postgresql:
+            statement = postgresql_insert(OrderCounterModel).values(**values)
+        else:
+            statement = sqlite_insert(OrderCounterModel).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["year"],
+            set_={"last_value": OrderCounterModel.last_value + 1},
+        ).returning(OrderCounterModel.last_value)
+        sequence = int(session.scalar(statement))
+        if sequence > 999_999:
+            raise RepositoryError("annual order number range exhausted")
+        return f"AD-{year}-{sequence:06d}"
 
     @staticmethod
     def _validated_items(items: Sequence[OrderItemInput]) -> List[OrderItemInput]:
@@ -856,12 +1443,27 @@ class OrderRepository:
         else:
             if draft.delivery_type not in {"pickup", "door"}:
                 raise InvalidOrderError("CDEK delivery_type must be pickup or door")
+            to_city_code = draft.cdek_to_city_code
+            tariff_code = draft.cdek_tariff_code
+            tariff_name = draft.cdek_tariff_name
+            delivery_mode_value = draft.cdek_delivery_mode
+            period_min_value = draft.cdek_period_min_days
+            period_max_value = draft.cdek_period_max_days
+            if (
+                to_city_code is None
+                or tariff_code is None
+                or tariff_name is None
+                or delivery_mode_value is None
+                or period_min_value is None
+                or period_max_value is None
+            ):
+                raise InvalidOrderError("CDEK delivery snapshot is incomplete")
             try:
-                _positive_integer(draft.cdek_to_city_code, "cdek_to_city_code")
-                _positive_integer(draft.cdek_tariff_code, "cdek_tariff_code")
-                _required_text(draft.cdek_tariff_name, "cdek_tariff_name")
+                _positive_integer(to_city_code, "cdek_to_city_code")
+                _positive_integer(tariff_code, "cdek_tariff_code")
+                _required_text(tariff_name, "cdek_tariff_name")
                 delivery_mode = _positive_integer(
-                    draft.cdek_delivery_mode, "cdek_delivery_mode"
+                    delivery_mode_value, "cdek_delivery_mode"
                 )
                 if delivery_mode > 4:
                     raise ValueError("cdek_delivery_mode must be between 1 and 4")
@@ -869,20 +1471,21 @@ class OrderRepository:
                     draft.delivery_amount_kopecks, "delivery_amount_kopecks"
                 )
                 period_min = _non_negative_integer(
-                    draft.cdek_period_min_days, "cdek_period_min_days"
+                    period_min_value, "cdek_period_min_days"
                 )
                 period_max = _non_negative_integer(
-                    draft.cdek_period_max_days, "cdek_period_max_days"
+                    period_max_value, "cdek_period_max_days"
                 )
                 if period_max < period_min:
                     raise ValueError("CDEK delivery period is invalid")
             except ValueError as exc:
                 raise InvalidOrderError(str(exc)) from exc
             if draft.delivery_type == "pickup":
+                office_code = draft.delivery_office_code
+                if office_code is None:
+                    raise InvalidOrderError("delivery_office_code is required")
                 try:
-                    _required_text(
-                        draft.delivery_office_code, "delivery_office_code"
-                    )
+                    _required_text(office_code, "delivery_office_code")
                 except ValueError as exc:
                     raise InvalidOrderError(str(exc)) from exc
                 if any(
@@ -945,6 +1548,7 @@ class OrderRepository:
             return None
         return OrderResponse(
             order_id=row.id,
+            order_number=row.order_number,
             status=row.status,
             created_at=row.created_at,
             total_boxes=row.total_boxes,
@@ -1023,6 +1627,10 @@ class OrderRepository:
         idempotency_key: Optional[str] = None,
         outbox_event_type: str = "order.created",
         enqueue_outbox: bool = True,
+        invoice_draft: InvoiceDraft | None = None,
+        enqueue_invoice_outbox: bool = True,
+        customer_session_token: str | None = None,
+        customer_session_ttl_seconds: int = 90 * 24 * 60 * 60,
         now: Optional[int] = None,
     ) -> CreateOrderResult:
         items = self._validate_draft(draft)
@@ -1123,9 +1731,11 @@ class OrderRepository:
                 return CreateOrderResult(response, False, False, True)
 
             order_id = str(uuid.uuid4())
+            order_number = self._next_order_number(session, created_at=timestamp)
             session.add(
                 OrderModel(
                     id=order_id,
+                    order_number=order_number,
                     status="accepted",
                     buyer_type=draft.buyer_type.strip(),
                     buyer_contact_name=draft.buyer_contact_name.strip(),
@@ -1170,6 +1780,15 @@ class OrderRepository:
             # No ORM relationships are needed by the repository, so flush the
             # parent explicitly before inserting FK-dependent snapshots/events.
             session.flush()
+            customer_session_issue: CustomerSessionIssue | None = None
+            if self.customer_sessions is not None:
+                customer_session_issue = self.customer_sessions.attach_order(
+                    session,
+                    order_id=order_id,
+                    token=customer_session_token,
+                    ttl_seconds=customer_session_ttl_seconds,
+                    now=timestamp,
+                )
             session.add_all(
                 OrderItemModel(
                     order_id=order_id,
@@ -1193,10 +1812,35 @@ class OrderRepository:
                 )
                 for line_number, snapshot in enumerate(snapshots, start=1)
             )
+            if invoice_draft is not None:
+                if self.invoices is None:
+                    raise RepositoryError("invoice repository is not configured")
+                self.invoices.create_pending(
+                    session,
+                    order_id=order_id,
+                    draft=invoice_draft,
+                    issued_at=timestamp,
+                )
             if enqueue_outbox:
                 session.add(
                     OutboxModel(
                         event_type=event_type,
+                        order_id=order_id,
+                        status="pending",
+                        attempt_count=0,
+                        available_at=timestamp,
+                        locked_until=None,
+                        lock_token=None,
+                        last_error=None,
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                        succeeded_at=None,
+                    )
+                )
+            if invoice_draft is not None and enqueue_invoice_outbox:
+                session.add(
+                    OutboxModel(
+                        event_type="invoice.generate",
                         order_id=order_id,
                         status="pending",
                         attempt_count=0,
@@ -1222,6 +1866,7 @@ class OrderRepository:
             session.flush()
             response = OrderResponse(
                 order_id=order_id,
+                order_number=order_number,
                 status="accepted",
                 created_at=timestamp,
                 total_boxes=totals.total_boxes,
@@ -1249,7 +1894,13 @@ class OrderRepository:
                 delivery_apartment=draft.delivery_apartment,
                 items=snapshots,
             )
-            return CreateOrderResult(response, True, False, False)
+            return CreateOrderResult(
+                response,
+                True,
+                False,
+                False,
+                customer_session_issue,
+            )
 
     def get_order_response(self, order_id: str) -> Optional[OrderResponse]:
         order_id = _required_text(order_id, "order_id")
@@ -1400,7 +2051,7 @@ class OutboxRepository:
                     updated_at=timestamp,
                 )
             )
-            return result.rowcount == 1
+            return int(getattr(result, "rowcount", 0)) == 1
 
     success = mark_success
 
@@ -1433,7 +2084,7 @@ class OutboxRepository:
                     updated_at=timestamp,
                 )
             )
-            return result.rowcount == 1
+            return int(getattr(result, "rowcount", 0)) == 1
 
     retry = mark_retry
 
@@ -1462,7 +2113,7 @@ class OutboxRepository:
                     updated_at=timestamp,
                 )
             )
-            return result.rowcount == 1
+            return int(getattr(result, "rowcount", 0)) == 1
 
     fail = mark_failed
 
@@ -1471,16 +2122,43 @@ class OutboxRepository:
             row = session.get(OutboxModel, int(message_id))
             return self._from_model(row) if row is not None else None
 
-    def get_for_order(self, order_id: str) -> Optional[OutboxMessage]:
+    def get_for_order(
+        self, order_id: str, *, event_type: str = "order.created"
+    ) -> Optional[OutboxMessage]:
         order_id = _required_text(order_id, "order_id")
+        event_type = _required_text(event_type, "event_type")
         with self.database.session() as session:
             row = session.scalar(
                 select(OutboxModel)
-                .where(OutboxModel.order_id == order_id)
+                .where(
+                    OutboxModel.order_id == order_id,
+                    OutboxModel.event_type == event_type,
+                )
                 .order_by(OutboxModel.id.desc())
                 .limit(1)
             )
             return self._from_model(row) if row is not None else None
+
+    def complete_pending_event(
+        self, order_id: str, *, event_type: str, now: Optional[int] = None
+    ) -> bool:
+        timestamp = _now(now)
+        with self.database.transaction() as session:
+            result = session.execute(
+                update(OutboxModel)
+                .where(
+                    OutboxModel.order_id == _required_text(order_id, "order_id"),
+                    OutboxModel.event_type == _required_text(event_type, "event_type"),
+                    OutboxModel.status == "pending",
+                )
+                .values(
+                    status="succeeded",
+                    last_error=None,
+                    succeeded_at=timestamp,
+                    updated_at=timestamp,
+                )
+            )
+            return int(getattr(result, "rowcount", 0)) == 1
 
     def count(self, *, status: Optional[str] = None) -> int:
         statement = select(func.count()).select_from(OutboxModel)
@@ -1492,8 +2170,16 @@ class OutboxRepository:
 
 __all__ = [
     "CreateOrderResult",
+    "CustomerInvoiceLookup",
+    "CustomerInvoicePdfRecord",
+    "CustomerOrderItemRecord",
+    "CustomerOrderLookup",
+    "CustomerOrderRecord",
+    "CustomerSessionIssue",
+    "CustomerSessionRepository",
     "IdempotencyConflictError",
     "InvalidOrderError",
+    "InvoiceRepository",
     "OrderDraft",
     "OrderItemInput",
     "OrderItemSnapshot",

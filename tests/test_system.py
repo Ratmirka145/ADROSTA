@@ -31,6 +31,7 @@ def test_health_and_readiness_are_healthy_with_seeded_catalog(
             "configuration": "ok",
             "database": "ok",
             "catalog": "ok",
+            "invoice": "configured",
             "destination": "store_only",
         },
     }
@@ -47,6 +48,16 @@ def test_readiness_fails_when_trusted_catalog_is_empty(
     assert response.status_code == 503
     assert response.json()["status"] == "not_ready"
     assert response.json()["checks"]["catalog"] == "empty"
+
+
+def test_readiness_fails_when_invoice_settings_are_incomplete(app_factory) -> None:
+    application = app_factory(SELLER_LEGAL_NAME="")
+
+    with TestClient(application) as client:
+        response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["invoice"] == "not_configured"
 
 
 def test_cors_preflight_allows_only_configured_origin(
@@ -68,7 +79,26 @@ def test_cors_preflight_allows_only_configured_origin(
     assert "idempotency-key" in response.headers[
         "access-control-allow-headers"
     ].lower()
-    assert response.headers.get("access-control-allow-credentials") != "true"
+    assert response.headers["access-control-allow-credentials"] == "true"
+
+
+def test_credentialed_customer_request_allows_only_configured_origin(
+    client: TestClient,
+    allowed_origin: str,
+) -> None:
+    allowed = client.get(
+        "/api/customer/orders/AD-2026-999999",
+        headers={"Origin": allowed_origin},
+    )
+    rejected = client.get(
+        "/api/customer/orders/AD-2026-999999",
+        headers={"Origin": "https://attacker.example"},
+    )
+
+    assert allowed.status_code == rejected.status_code == 404
+    assert allowed.headers["access-control-allow-origin"] == allowed_origin
+    assert allowed.headers["access-control-allow-credentials"] == "true"
+    assert "access-control-allow-origin" not in rejected.headers
 
 
 def test_cors_preflight_rejects_unconfigured_origin(client: TestClient) -> None:

@@ -7,6 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import app.config as config_module
 from app.config import ConfigError, Settings
 from app.security import resolve_client_ip
 
@@ -117,6 +118,48 @@ def test_production_rejects_insecure_origin(tmp_path: Path) -> None:
         Settings.from_env(environ, load_env_file=False)
 
 
+def test_process_test_settings_do_not_load_dotenv(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("dotenv must not be loaded in test mode")
+
+    monkeypatch.setattr(config_module, "load_dotenv", fail_if_called)
+    config_module.clear_settings_cache()
+    try:
+        assert config_module.get_settings().is_test
+    finally:
+        config_module.clear_settings_cache()
+
+
+def test_production_rejects_insecure_customer_cookie(tmp_path: Path) -> None:
+    environ = _production_env(tmp_path)
+    environ["CUSTOMER_SESSION_COOKIE_SECURE"] = "false"
+    with pytest.raises(ConfigError, match="COOKIE_SECURE"):
+        Settings.from_env(environ, load_env_file=False)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("CUSTOMER_SESSION_COOKIE_NAME", "invalid cookie name"),
+        ("CUSTOMER_SESSION_COOKIE_SAMESITE", "permissive"),
+        ("CUSTOMER_SESSION_COOKIE_PATH", "/api; Domain=example.test"),
+        ("CUSTOMER_ORDER_PAGE_URL", "https://user:pass@example.test/order"),
+    ],
+)
+def test_invalid_customer_access_configuration_is_rejected(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    environ = _production_env(tmp_path)
+    environ[name] = value
+    with pytest.raises(ConfigError):
+        Settings.from_env(environ, load_env_file=False)
+
+
 def test_allowed_hosts_rejects_port(tmp_path: Path) -> None:
     environ = _production_env(tmp_path)
     environ["ALLOWED_HOSTS"] = "api.example.test:443"
@@ -160,6 +203,8 @@ def test_settings_repr_does_not_expose_secrets(tmp_path: Path) -> None:
         {
             "CDEK_CLIENT_ID": "cdek-client-id-not-for-repr",
             "CDEK_CLIENT_SECRET": "cdek-secret-not-for-repr",
+            "SELLER_CHECKING_ACCOUNT": "40702810000000000001",
+            "SELLER_CORRESPONDENT_ACCOUNT": "30101810000000000000",
         }
     )
     settings = Settings.from_env(environ, load_env_file=False)
@@ -167,6 +212,15 @@ def test_settings_repr_does_not_expose_secrets(tmp_path: Path) -> None:
     assert "database-secret" not in repr(settings)
     assert environ["CDEK_CLIENT_ID"] not in repr(settings)
     assert environ["CDEK_CLIENT_SECRET"] not in repr(settings)
+    assert environ["SELLER_CHECKING_ACCOUNT"] not in repr(settings)
+    assert environ["SELLER_CORRESPONDENT_ACCOUNT"] not in repr(settings)
+
+
+def test_invoice_payment_purpose_rejects_unknown_placeholder(tmp_path: Path) -> None:
+    environ = _production_env(tmp_path)
+    environ["INVOICE_PAYMENT_PURPOSE_TEMPLATE"] = "Оплата {unknown_value}"
+    with pytest.raises(ConfigError, match="unsupported placeholder"):
+        Settings.from_env(environ, load_env_file=False)
 
 
 @pytest.mark.parametrize(

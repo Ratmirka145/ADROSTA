@@ -6,13 +6,21 @@ from app.cdek import CdekService
 from app.config import Settings
 from app.database import Database
 from app.integrations import CdekClient, WebhookDestination
+from app.invoice import InvoicePdfRenderer
 from app.repositories import (
+    CustomerSessionRepository,
+    InvoiceRepository,
     OrderRepository,
     OutboxRepository,
     ProductRepository,
     RateLimitRepository,
 )
-from app.services import OrderService, OutboxProcessor
+from app.services import (
+    CustomerAccessService,
+    InvoiceService,
+    OrderService,
+    OutboxProcessor,
+)
 
 
 @dataclass(slots=True)
@@ -22,6 +30,10 @@ class ApplicationContext:
     products: ProductRepository
     orders: OrderRepository | None
     outbox: OutboxRepository
+    invoices: InvoiceRepository
+    invoice_service: InvoiceService
+    customer_sessions: CustomerSessionRepository
+    customer_access_service: CustomerAccessService
     rate_limits: RateLimitRepository | None
     order_service: OrderService
     cdek_service: CdekService
@@ -32,6 +44,14 @@ class ApplicationContext:
         database = Database(settings.database_url)
         products = ProductRepository(database)
         outbox = OutboxRepository(database)
+        invoices = InvoiceRepository(database)
+        customer_sessions = CustomerSessionRepository(database)
+        customer_access_service = CustomerAccessService(customer_sessions)
+        invoice_service = InvoiceService(
+            settings=settings,
+            invoices=invoices,
+            renderer=InvoicePdfRenderer(settings.invoice_font_path),
+        )
 
         orders: OrderRepository | None = None
         rate_limits: RateLimitRepository | None = None
@@ -41,6 +61,8 @@ class ApplicationContext:
                 settings.app_hash_secret,
                 idempotency_ttl_seconds=settings.idempotency_ttl_seconds,
                 duplicate_window_seconds=settings.duplicate_window_seconds,
+                invoices=invoices,
+                customer_sessions=customer_sessions,
             )
             rate_limits = RateLimitRepository(database, settings.app_hash_secret)
 
@@ -50,6 +72,8 @@ class ApplicationContext:
             orders=orders,
             outbox=outbox,
             rate_limits=rate_limits,
+            invoice_service=invoice_service,
+            customer_sessions=customer_sessions,
         )
         cdek_client = None
         if settings.cdek_client_id and settings.cdek_client_secret:
@@ -72,6 +96,10 @@ class ApplicationContext:
             products=products,
             orders=orders,
             outbox=outbox,
+            invoices=invoices,
+            invoice_service=invoice_service,
+            customer_sessions=customer_sessions,
+            customer_access_service=customer_access_service,
             rate_limits=rate_limits,
             order_service=service,
             cdek_service=cdek_service,
@@ -79,20 +107,21 @@ class ApplicationContext:
         )
 
     def outbox_processor(self) -> OutboxProcessor:
-        if not self.settings.webhook_enabled or not self.settings.webhook_url:
-            raise RuntimeError("Webhook delivery is not configured")
         if self.orders is None:
             raise RuntimeError("APP_HASH_SECRET is not configured")
-        destination = WebhookDestination(
-            url=self.settings.webhook_url,
-            token=self.settings.webhook_token,
-            timeout_seconds=self.settings.webhook_timeout_seconds,
-        )
+        destination = None
+        if self.settings.webhook_enabled and self.settings.webhook_url:
+            destination = WebhookDestination(
+                url=self.settings.webhook_url,
+                token=self.settings.webhook_token,
+                timeout_seconds=self.settings.webhook_timeout_seconds,
+            )
         return OutboxProcessor(
             settings=self.settings,
             orders=self.orders,
             outbox=self.outbox,
             destination=destination,
+            invoice_service=self.invoice_service,
         )
 
     def close(self) -> None:

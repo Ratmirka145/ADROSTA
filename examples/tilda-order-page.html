@@ -1,0 +1,172 @@
+<!--
+  ADROSTA customer order page for a Tilda T123 block.
+  Replace API_BASE with the public HTTPS API origin. No secrets belong here.
+-->
+<section id="adrosta-order" aria-live="polite">
+  <p id="adrosta-order-state">Загрузка заказа…</p>
+  <div id="adrosta-order-content" hidden>
+    <h2 id="adrosta-order-number"></h2>
+    <p id="adrosta-order-date"></p>
+    <p id="adrosta-order-status"></p>
+    <div id="adrosta-order-items"></div>
+    <dl id="adrosta-order-totals"></dl>
+    <h3>Доставка</h3>
+    <p id="adrosta-order-delivery"></p>
+    <section id="adrosta-order-invoice" hidden>
+      <h3>Счёт</h3>
+      <p id="adrosta-invoice-info"></p>
+      <p>
+        <a id="adrosta-invoice-view" target="_blank" rel="noopener">Посмотреть счёт</a>
+        <a id="adrosta-invoice-download">Скачать PDF</a>
+      </p>
+    </section>
+  </div>
+</section>
+
+<style>
+  #adrosta-order { max-width: 760px; margin: 0 auto; font-family: Arial, sans-serif; }
+  #adrosta-order table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+  #adrosta-order th, #adrosta-order td { padding: 10px; border-bottom: 1px solid #ddd; text-align: left; }
+  #adrosta-order td:last-child, #adrosta-order th:last-child { text-align: right; }
+  #adrosta-order dl { display: grid; grid-template-columns: 1fr auto; gap: 8px 20px; }
+  #adrosta-order dt, #adrosta-order dd { margin: 0; }
+  #adrosta-order a { display: inline-block; margin: 8px 16px 8px 0; }
+</style>
+
+<script>
+(function renderAdrostaOrderPage() {
+  "use strict";
+
+  var API_BASE = "https://api.example.test"; // Replace with the ADROSTA API origin.
+  var ORDER_NUMBER_PATTERN = /^AD-\d{4}-\d{6}$/;
+  var state = document.getElementById("adrosta-order-state");
+  var content = document.getElementById("adrosta-order-content");
+
+  function setState(message) {
+    state.textContent = message;
+    state.hidden = false;
+    content.hidden = true;
+  }
+
+  function kopecks(value) {
+    if (!Number.isSafeInteger(value)) {
+      return "—";
+    }
+    return new Intl.NumberFormat("ru-RU", {
+      style: "currency",
+      currency: "RUB"
+    }).format(value / 100);
+  }
+
+  function dateTime(value) {
+    var date = new Date(value);
+    return Number.isNaN(date.getTime())
+      ? "—"
+      : new Intl.DateTimeFormat("ru-RU", { dateStyle: "long" }).format(date);
+  }
+
+  function appendCell(row, value, tagName) {
+    var cell = document.createElement(tagName || "td");
+    cell.textContent = value;
+    row.appendChild(cell);
+  }
+
+  function renderItems(items) {
+    var target = document.getElementById("adrosta-order-items");
+    target.replaceChildren();
+    var table = document.createElement("table");
+    var head = document.createElement("tr");
+    ["Товар", "Количество", "Сумма"].forEach(function addHeading(label) {
+      appendCell(head, label, "th");
+    });
+    table.appendChild(head);
+    items.forEach(function addItem(item) {
+      var row = document.createElement("tr");
+      appendCell(row, item.name + " (" + item.sku + ")");
+      appendCell(row, String(item.quantity) + " " + item.unit);
+      appendCell(row, kopecks(item.lineAmountKopecks));
+      table.appendChild(row);
+    });
+    target.appendChild(table);
+  }
+
+  function addTotal(target, label, value) {
+    var term = document.createElement("dt");
+    var amount = document.createElement("dd");
+    term.textContent = label;
+    amount.textContent = kopecks(value);
+    target.appendChild(term);
+    target.appendChild(amount);
+  }
+
+  function renderOrder(order) {
+    document.getElementById("adrosta-order-number").textContent =
+      "Заказ " + order.orderNumber;
+    document.getElementById("adrosta-order-date").textContent =
+      "Оформлен: " + dateTime(order.createdAt);
+    document.getElementById("adrosta-order-status").textContent =
+      order.status === "accepted" ? "Статус: заказ принят" : "Статус: " + order.status;
+    renderItems(Array.isArray(order.items) ? order.items : []);
+
+    var totals = document.getElementById("adrosta-order-totals");
+    totals.replaceChildren();
+    addTotal(totals, "Товары", order.totals.productsAmountKopecks);
+    addTotal(totals, "Доставка", order.totals.deliveryAmountKopecks);
+    addTotal(totals, "Итого", order.totals.grandTotalKopecks);
+    document.getElementById("adrosta-order-delivery").textContent =
+      order.delivery.description;
+
+    var invoiceSection = document.getElementById("adrosta-order-invoice");
+    if (order.invoice) {
+      document.getElementById("adrosta-invoice-info").textContent =
+        "Счёт " + order.invoice.number + " от " + dateTime(order.invoice.issuedAt);
+      invoiceSection.hidden = false;
+      if (order.invoice.pdfAvailable) {
+        var pdfBase = API_BASE + "/api/customer/orders/" +
+          encodeURIComponent(order.orderNumber) + "/invoice.pdf";
+        document.getElementById("adrosta-invoice-view").href =
+          pdfBase + "?disposition=inline";
+        document.getElementById("adrosta-invoice-download").href =
+          pdfBase + "?disposition=attachment";
+      } else {
+        document.getElementById("adrosta-invoice-view").hidden = true;
+        document.getElementById("adrosta-invoice-download").hidden = true;
+      }
+    }
+
+    try {
+      window.localStorage.setItem("last_order_number", order.orderNumber);
+    } catch (_storageError) {
+      // The page works when storage is disabled; only the public number is optional.
+    }
+    state.hidden = true;
+    content.hidden = false;
+  }
+
+  var number = new URLSearchParams(window.location.search).get("number");
+  if (!number || !ORDER_NUMBER_PATTERN.test(number)) {
+    setState("Номер заказа не указан или имеет неверный формат.");
+    return;
+  }
+
+  fetch(API_BASE + "/api/customer/orders/" + encodeURIComponent(number), {
+    method: "GET",
+    mode: "cors",
+    credentials: "include",
+    cache: "no-store",
+    headers: { "Accept": "application/json" }
+  }).then(function handleResponse(response) {
+    if (response.status === 404) {
+      throw { customerMessage: "Заказ недоступен в этом браузере." };
+    }
+    if (!response.ok) {
+      throw { customerMessage: "Сервис временно недоступен. Попробуйте позже." };
+    }
+    return response.json();
+  }).then(renderOrder).catch(function handleError(error) {
+    setState(error && error.customerMessage
+      ? error.customerMessage
+      : "Не удалось загрузить заказ. Проверьте соединение и повторите попытку.");
+  });
+})();
+</script>

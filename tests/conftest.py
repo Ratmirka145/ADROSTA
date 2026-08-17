@@ -85,6 +85,20 @@ def settings_factory(
             "WEBHOOK_ENABLED": "false",
             "OUTBOX_ENABLED": "true",
             "ALLOW_STORE_ONLY": "true",
+            "SELLER_LEGAL_NAME": "ООО АДРОСТА ТЕСТ",
+            "SELLER_INN": "7707083893",
+            "SELLER_KPP": "773601001",
+            "SELLER_LEGAL_ADDRESS": "г. Москва, тестовый адрес, д. 10",
+            "SELLER_BANK_NAME": "Тестовый банк",
+            "SELLER_BIK": "044525000",
+            "SELLER_CHECKING_ACCOUNT": "40702810000000000001",
+            "SELLER_CORRESPONDENT_ACCOUNT": "30101810000000000000",
+            "SELLER_PHONE": "+79990000000",
+            "SELLER_EMAIL": "seller@example.test",
+            "INVOICE_TAX_TEXT": "Без НДС (тест)",
+            "INVOICE_PAYMENT_PURPOSE_TEMPLATE": (
+                "Оплата по счёту {invoice_number} от {invoice_date}"
+            ),
         }
         for name, value in overrides.items():
             if isinstance(value, bool):

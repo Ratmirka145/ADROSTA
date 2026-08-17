@@ -17,6 +17,7 @@ from app.observability import (
 from app.rate_limit_middleware import OrderRateLimitMiddleware
 from app.routers.cart import router as cart_router
 from app.routers.cdek import router as cdek_router
+from app.routers.customer import router as customer_router
 from app.routers.health import router as health_router
 from app.routers.orders import router as orders_router
 
@@ -59,7 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.add_middleware(
             CORSMiddleware,
             allow_origins=list(runtime_settings.cors_allowed_origins),
-            allow_credentials=False,
+            allow_credentials=True,
             allow_methods=["GET", "POST", "OPTIONS"],
             allow_headers=["Content-Type", "Idempotency-Key", "X-Request-ID"],
             expose_headers=[
@@ -74,6 +75,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(health_router)
     application.include_router(cart_router)
     application.include_router(cdek_router)
+    application.include_router(customer_router)
     application.include_router(orders_router)
 
     @application.get("/", tags=["system"])

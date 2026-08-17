@@ -8,6 +8,7 @@ totals are resolved and calculated by the domain layer.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -466,6 +467,8 @@ class CdekQuoteResponse(ApiModel):
 
 class OrderResponse(ApiModel):
     order_id: UUID
+    order_number: str
+    order_page_url: str
     status: Literal["accepted"] = "accepted"
     integration_status: Literal["pending", "stored", "delivered", "failed"]
     replayed: bool = False
@@ -478,6 +481,8 @@ class OrderResponse(ApiModel):
         cls,
         *,
         order_id: UUID,
+        order_number: str,
+        order_page_url: str,
         calculation: Any,
         integration_status: Literal["pending", "stored", "delivered", "failed"],
         replayed: bool = False,
@@ -495,6 +500,8 @@ class OrderResponse(ApiModel):
         )
         return cls(
             order_id=order_id,
+            order_number=order_number,
+            order_page_url=order_page_url,
             integration_status=integration_status,
             replayed=replayed,
             items=rendered.items,
@@ -503,6 +510,47 @@ class OrderResponse(ApiModel):
                 method=DeliveryMethod.SELF_PICKUP
             ),
         )
+
+
+class CustomerOrderItemResponse(ApiModel):
+    sku: str
+    name: str
+    quantity: int
+    unit: str
+    line_amount_kopecks: int
+
+
+class CustomerOrderTotalsResponse(ApiModel):
+    products_amount_kopecks: int
+    delivery_amount_kopecks: int
+    grand_total_kopecks: int
+
+
+class CustomerOrderDeliveryResponse(ApiModel):
+    method: DeliveryMethod
+    type: CdekDeliveryType | None = None
+    description: str
+    city: str | None = None
+    office_code: str | None = None
+    tariff_name: str | None = None
+    period_min_days: int | None = None
+    period_max_days: int | None = None
+
+
+class CustomerInvoiceResponse(ApiModel):
+    number: str
+    issued_at: datetime
+    pdf_available: bool
+
+
+class CustomerOrderResponse(ApiModel):
+    order_number: str
+    status: Literal["accepted"]
+    created_at: datetime
+    items: list[CustomerOrderItemResponse]
+    totals: CustomerOrderTotalsResponse
+    delivery: CustomerOrderDeliveryResponse
+    invoice: CustomerInvoiceResponse | None = None
 
 
 __all__ = [
@@ -521,6 +569,11 @@ __all__ = [
     "CartCalculateRequest",
     "CalculatedItemResponse",
     "Company",
+    "CustomerInvoiceResponse",
+    "CustomerOrderDeliveryResponse",
+    "CustomerOrderItemResponse",
+    "CustomerOrderResponse",
+    "CustomerOrderTotalsResponse",
     "Delivery",
     "DeliveryMethod",
     "NormalizedEmail",

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import math
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal, TYPE_CHECKING
+from urllib.parse import urlencode
 from uuid import UUID
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -26,6 +31,8 @@ from app.errors import (
     DuplicateOrderError,
     IdempotencyConflictError as ApiIdempotencyConflictError,
     IdempotencyKeyRequiredError,
+    InvoiceGenerationFailedError,
+    InvoiceNotConfiguredError,
     RateLimitError,
     PriceTierNotFoundError,
     ServiceUnavailableError,
@@ -34,8 +41,13 @@ from app.errors import (
 )
 from app.integrations import DestinationError, OrderDestination
 from app.repositories import (
+    CustomerInvoicePdfRecord,
+    CustomerOrderRecord,
+    CustomerSessionIssue,
+    CustomerSessionRepository,
     IdempotencyConflictError as RepositoryIdempotencyConflictError,
     InvalidOrderError,
+    InvoiceRepository,
     OrderDraft,
     OrderItemInput,
     OrderRepository,
@@ -45,10 +57,16 @@ from app.repositories import (
     RateLimitRepository,
     RepositoryError,
 )
+from app.invoice import InvoiceDraft, InvoiceItemDraft, InvoicePdfRenderer, InvoiceSnapshot
 from app.schemas import (
     CalculatedItemResponse,
     CdekTariffOptionResponse,
     CartCalculateRequest,
+    CustomerInvoiceResponse,
+    CustomerOrderDeliveryResponse,
+    CustomerOrderItemResponse,
+    CustomerOrderResponse,
+    CustomerOrderTotalsResponse,
     DeliveryMethod,
     OrderCommercialTotalsResponse,
     OrderCalculationResponse,
@@ -70,6 +88,7 @@ class CreateOrderOutcome:
     response: OrderResponse
     created: bool
     replayed: bool
+    customer_session_issue: CustomerSessionIssue | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +105,224 @@ class ProcessingSummary:
     failed: int = 0
 
 
+class CustomerAccessService:
+    def __init__(self, customer_sessions: CustomerSessionRepository) -> None:
+        self.customer_sessions = customer_sessions
+
+    @staticmethod
+    def _delivery_description(record: CustomerOrderRecord) -> str:
+        if record.delivery_method == "self_pickup":
+            return "Самовывоз"
+        if record.delivery_type == "pickup":
+            return (
+                f"СДЭК, пункт выдачи {record.delivery_office_code}"
+                if record.delivery_office_code
+                else "СДЭК, пункт выдачи"
+            )
+        return "СДЭК, доставка до двери"
+
+    def get_order(
+        self,
+        token: str | None,
+        order_number: str,
+        *,
+        now: int | None = None,
+    ) -> tuple[CustomerOrderResponse | None, bool]:
+        try:
+            lookup = self.customer_sessions.lookup_order(
+                token,
+                order_number,
+                now=now,
+            )
+        except SQLAlchemyError:
+            raise ServiceUnavailableError() from None
+        if lookup.order is None:
+            return None, lookup.session_valid
+        record = lookup.order
+        invoice = None
+        if record.invoice_number is not None and record.invoice_issued_at is not None:
+            invoice = CustomerInvoiceResponse(
+                number=record.invoice_number,
+                issued_at=datetime.fromtimestamp(record.invoice_issued_at, UTC),
+                pdf_available=record.invoice_pdf_available,
+            )
+        return (
+            CustomerOrderResponse(
+                order_number=record.order_number,
+                status=record.status,  # type: ignore[arg-type]
+                created_at=datetime.fromtimestamp(record.created_at, UTC),
+                items=[
+                    CustomerOrderItemResponse(
+                        sku=item.sku,
+                        name=item.name,
+                        quantity=item.quantity,
+                        unit=item.unit,
+                        line_amount_kopecks=item.line_amount_kopecks,
+                    )
+                    for item in record.items
+                ],
+                totals=CustomerOrderTotalsResponse(
+                    products_amount_kopecks=record.products_amount_kopecks,
+                    delivery_amount_kopecks=record.delivery_amount_kopecks,
+                    grand_total_kopecks=record.grand_total_kopecks,
+                ),
+                delivery=CustomerOrderDeliveryResponse(
+                    method=record.delivery_method,  # type: ignore[arg-type]
+                    type=record.delivery_type,  # type: ignore[arg-type]
+                    description=self._delivery_description(record),
+                    city=record.delivery_city,
+                    office_code=record.delivery_office_code,
+                    tariff_name=record.cdek_tariff_name,
+                    period_min_days=record.cdek_period_min_days,
+                    period_max_days=record.cdek_period_max_days,
+                ),
+                invoice=invoice,
+            ),
+            lookup.session_valid,
+        )
+
+    def get_invoice_pdf(
+        self,
+        token: str | None,
+        order_number: str,
+        *,
+        now: int | None = None,
+    ) -> tuple[CustomerInvoicePdfRecord | None, bool]:
+        try:
+            lookup = self.customer_sessions.lookup_invoice_pdf(
+                token,
+                order_number,
+                now=now,
+            )
+        except SQLAlchemyError:
+            raise ServiceUnavailableError() from None
+        if lookup.invoice is None:
+            return None, lookup.session_valid
+        invoice = lookup.invoice
+        actual_digest = hashlib.sha256(invoice.pdf_bytes).hexdigest()
+        if (
+            not invoice.pdf_bytes.startswith(b"%PDF")
+            or not hmac.compare_digest(actual_digest, invoice.pdf_sha256)
+        ):
+            raise ServiceUnavailableError()
+        return invoice, lookup.session_valid
+
+    def logout(self, token: str | None) -> None:
+        try:
+            self.customer_sessions.revoke(token)
+        except SQLAlchemyError:
+            raise ServiceUnavailableError() from None
+
+
+class InvoiceService:
+    TEMPLATE_VERSION = "invoice-v1"
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        invoices: InvoiceRepository,
+        renderer: InvoicePdfRenderer,
+    ) -> None:
+        self.settings = settings
+        self.invoices = invoices
+        self.renderer = renderer
+
+    def prepare_draft(
+        self,
+        order: OrderCreate,
+        calculation: OrderCalculation,
+        *,
+        delivery_amount_kopecks: int,
+    ) -> InvoiceDraft:
+        if not self.settings.invoice_configured:
+            raise InvoiceNotConfiguredError()
+        company = order.company
+        items = [
+            InvoiceItemDraft(
+                line_number=index,
+                line_type="product",
+                sku=item.sku,
+                name=item.name,
+                quantity=item.units,
+                unit="шт.",
+                unit_price_kopecks=item.price_per_unit_kopecks,
+                line_amount_kopecks=item.line_amount_kopecks,
+            )
+            for index, item in enumerate(calculation.items, start=1)
+        ]
+        if delivery_amount_kopecks > 0:
+            items.append(
+                InvoiceItemDraft(
+                    line_number=len(items) + 1,
+                    line_type="delivery",
+                    sku=None,
+                    name="Доставка СДЭК",
+                    quantity=1,
+                    unit="усл.",
+                    unit_price_kopecks=delivery_amount_kopecks,
+                    line_amount_kopecks=delivery_amount_kopecks,
+                )
+            )
+        products_amount = calculation.totals.products_amount_kopecks
+        return InvoiceDraft(
+            template_version=self.TEMPLATE_VERSION,
+            seller_legal_name=self.settings.seller_legal_name or "",
+            seller_inn=self.settings.seller_inn or "",
+            seller_kpp=self.settings.seller_kpp or "",
+            seller_legal_address=self.settings.seller_legal_address or "",
+            seller_bank_name=self.settings.seller_bank_name or "",
+            seller_bik=self.settings.seller_bik or "",
+            seller_checking_account=self.settings.seller_checking_account or "",
+            seller_correspondent_account=(
+                self.settings.seller_correspondent_account or ""
+            ),
+            seller_phone=self.settings.seller_phone,
+            seller_email=self.settings.seller_email,
+            buyer_name=company.name if company else order.buyer.contact_name,
+            buyer_inn=company.inn if company else None,
+            buyer_kpp=company.kpp if company else None,
+            buyer_legal_address=company.legal_address if company else None,
+            products_amount_kopecks=products_amount,
+            delivery_amount_kopecks=delivery_amount_kopecks,
+            grand_total_kopecks=products_amount + delivery_amount_kopecks,
+            tax_text=self.settings.invoice_tax_text or "",
+            payment_purpose_template=(
+                self.settings.invoice_payment_purpose_template or ""
+            ),
+            items=tuple(items),
+        )
+
+    def ensure_invoice(
+        self, order_id: str, *, now: int | None = None
+    ) -> InvoiceSnapshot:
+        snapshot = self.invoices.get_for_order(order_id)
+        if snapshot is None:
+            raise InvoiceGenerationFailedError()
+        if snapshot.status == "generated":
+            return snapshot
+        timestamp = int(time.time()) if now is None else int(now)
+        try:
+            pdf_bytes = self.renderer.render(snapshot)
+            digest = hashlib.sha256(pdf_bytes).hexdigest()
+            return self.invoices.store_generated(
+                snapshot.id,
+                pdf_bytes=pdf_bytes,
+                pdf_sha256=digest,
+                generated_at=timestamp,
+            )
+        except Exception:
+            try:
+                self.invoices.mark_failed(snapshot.id, now=timestamp)
+            except Exception as state_error:
+                logger.error(
+                    "invoice_failure_state_update_failed invoice_id=%s exception_type=%s",
+                    snapshot.id,
+                    type(state_error).__name__,
+                )
+            raise InvoiceGenerationFailedError() from None
+
+
 class OrderService:
     def __init__(
         self,
@@ -96,6 +333,8 @@ class OrderService:
         outbox: OutboxRepository,
         rate_limits: RateLimitRepository | None,
         cdek_service: CdekService | None = None,
+        invoice_service: InvoiceService | None = None,
+        customer_sessions: CustomerSessionRepository | None = None,
     ) -> None:
         self.settings = settings
         self.products = products
@@ -103,6 +342,8 @@ class OrderService:
         self.outbox = outbox
         self.rate_limits = rate_limits
         self.cdek_service = cdek_service
+        self.invoice_service = invoice_service
+        self.customer_sessions = customer_sessions
 
     def attach_cdek_service(self, cdek_service: CdekService) -> None:
         self.cdek_service = cdek_service
@@ -115,6 +356,7 @@ class OrderService:
         client_ip: str,
         rate_limit_result: RateLimitResult | None = None,
         rate_limit_error: bool = False,
+        customer_session_token: str | None = None,
         request_id: str | None = None,
         now: int | None = None,
     ) -> CreateOrderOutcome:
@@ -156,6 +398,16 @@ class OrderService:
             raise ServiceUnavailableError() from None
 
         if replay is not None:
+            if self.customer_sessions is not None:
+                try:
+                    self.customer_sessions.has_order_access(
+                        customer_session_token,
+                        replay.order_id,
+                        now=now,
+                    )
+                except SQLAlchemyError:
+                    raise ServiceUnavailableError() from None
+            self._ensure_invoice_safely(replay.order_id, now=now)
             integration_status = self._integration_status(replay.order_id)
             return CreateOrderOutcome(
                 response=self._render_response(
@@ -200,6 +452,16 @@ class OrderService:
                 calculation=calculation,
                 request_id=request_id,
             )
+        delivery_amount = (
+            selected_tariff.delivery_amount_kopecks if selected_tariff else 0
+        )
+        if self.invoice_service is None:
+            raise InvoiceNotConfiguredError()
+        invoice_draft = self.invoice_service.prepare_draft(
+            order,
+            calculation,
+            delivery_amount_kopecks=delivery_amount,
+        )
 
         try:
             result = self.orders.create_order(
@@ -210,6 +472,12 @@ class OrderService:
                 idempotency_key=idempotency_key,
                 enqueue_outbox=(
                     self.settings.webhook_enabled and self.settings.outbox_enabled
+                ),
+                invoice_draft=invoice_draft,
+                enqueue_invoice_outbox=self.settings.outbox_enabled,
+                customer_session_token=customer_session_token,
+                customer_session_ttl_seconds=(
+                    self.settings.customer_session_ttl_seconds
                 ),
                 now=now,
             )
@@ -227,6 +495,8 @@ class OrderService:
         if result.duplicate:
             raise DuplicateOrderError()
 
+        self._ensure_invoice_safely(result.response.order_id, now=now)
+
         integration_status = self._integration_status(result.response.order_id)
         return CreateOrderOutcome(
             response=self._render_response(
@@ -236,7 +506,21 @@ class OrderService:
             ),
             created=result.created,
             replayed=result.replayed,
+            customer_session_issue=result.customer_session_issue,
         )
+
+    def _ensure_invoice_safely(self, order_id: str, *, now: int | None) -> None:
+        if self.invoice_service is None:
+            return
+        try:
+            self.invoice_service.ensure_invoice(order_id, now=now)
+            self.outbox.complete_pending_event(
+                order_id,
+                event_type="invoice.generate",
+                now=now,
+            )
+        except (InvoiceGenerationFailedError, SQLAlchemyError, RepositoryError):
+            logger.warning("invoice_generation_deferred order_id=%s", order_id)
 
     def calculate_cart(
         self, request: CartCalculateRequest
@@ -274,6 +558,9 @@ class OrderService:
             "configuration": "ok" if self.settings.app_hash_secret else "missing_secret",
             "database": "unavailable",
             "catalog": "unavailable",
+            "invoice": (
+                "configured" if self.settings.invoice_configured else "not_configured"
+            ),
             "destination": "configured" if self.settings.webhook_enabled else "store_only",
         }
         try:
@@ -288,6 +575,7 @@ class OrderService:
             checks["database"] == "ok"
             and checks["catalog"] == "ok"
             and checks["configuration"] == "ok"
+            and checks["invoice"] == "configured"
             and destination_ready
         )
         if not destination_ready:
@@ -383,8 +671,8 @@ class OrderService:
             "failed": "failed",
         }.get(message.status, "pending")  # type: ignore[return-value]
 
-    @staticmethod
     def _render_response(
+        self,
         stored,
         *,
         integration_status: Literal["pending", "stored", "delivered", "failed"],
@@ -440,6 +728,11 @@ class OrderService:
         )
         return OrderResponse(
             order_id=UUID(stored.order_id),
+            order_number=stored.order_number,
+            order_page_url=(
+                f"{self.settings.customer_order_page_url}?"
+                f"{urlencode({'number': stored.order_number})}"
+            ),
             status="accepted",
             integration_status=integration_status,
             replayed=replayed,
@@ -456,12 +749,14 @@ class OutboxProcessor:
         settings: Settings,
         orders: OrderRepository,
         outbox: OutboxRepository,
-        destination: OrderDestination,
+        destination: OrderDestination | None,
+        invoice_service: InvoiceService | None = None,
     ) -> None:
         self.settings = settings
         self.orders = orders
         self.outbox = outbox
         self.destination = destination
+        self.invoice_service = invoice_service
 
     def process_once(self, *, now: int | None = None) -> ProcessingSummary:
         claimed = delivered = retry_scheduled = failed = 0
@@ -478,6 +773,39 @@ class OutboxProcessor:
             claimed += 1
             token = message.lock_token
             if not token:
+                continue
+            if message.event_type == "invoice.generate":
+                try:
+                    if self.invoice_service is None:
+                        raise InvoiceGenerationFailedError()
+                    self.invoice_service.ensure_invoice(message.order_id, now=now)
+                except Exception:
+                    if message.attempt_count < self.settings.webhook_max_attempts:
+                        self.outbox.mark_retry(
+                            message.id,
+                            token,
+                            "INVOICE_GENERATION_FAILED",
+                            delay_seconds=self._retry_delay(message.attempt_count),
+                            now=now,
+                        )
+                        retry_scheduled += 1
+                    else:
+                        self.outbox.mark_failed(
+                            message.id,
+                            token,
+                            "INVOICE_GENERATION_FAILED",
+                            now=now,
+                        )
+                        failed += 1
+                else:
+                    self.outbox.mark_success(message.id, token, now=now)
+                    delivered += 1
+                continue
+            if message.event_type != "order.created" or self.destination is None:
+                self.outbox.mark_failed(
+                    message.id, token, "OUTBOX_EVENT_UNSUPPORTED", now=now
+                )
+                failed += 1
                 continue
             order = self.orders.get_order_for_webhook(message.order_id)
             if order is None:

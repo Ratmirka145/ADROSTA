@@ -250,6 +250,16 @@ def test_creates_cdek_pickup_order_and_persists_delivery_fields(
     }
     assert order_cdek_client.tariff_calls == 1
     assert order_cdek_client.office_calls == 1
+    invoice = app.state.context.invoices.get_for_order(body["orderId"])
+    assert invoice is not None
+    delivery_lines = [item for item in invoice.items if item.line_type == "delivery"]
+    assert len(delivery_lines) == 1
+    assert delivery_lines[0].name == "Доставка СДЭК"
+    assert delivery_lines[0].quantity == 1
+    assert delivery_lines[0].unit == "усл."
+    assert delivery_lines[0].line_amount_kopecks == 123_450
+    assert order_cdek_client.tariff_calls == 1
+    assert order_cdek_client.office_calls == 1
     stored = _stored_order(
         app,
         response.json()["orderId"],

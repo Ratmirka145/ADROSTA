@@ -15,7 +15,7 @@ logger = logging.getLogger("adrosta.outbox")
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.worker",
-        description="Доставка сохранённых заказов в настроенный webhook.",
+        description="Обработка фоновых задач invoice и webhook.",
     )
     parser.add_argument("--once", action="store_true", help="Обработать одну пачку")
     return parser

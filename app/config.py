@@ -27,6 +27,9 @@ _ENVIRONMENTS: Final = frozenset({"development", "test", "production"})
 _CDEK_ENVIRONMENTS: Final = frozenset({"test", "production"})
 _CDEK_ORIGIN_MODES: Final = frozenset({"warehouse", "door"})
 _LOG_LEVELS: Final = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_COOKIE_SAMESITE_VALUES: Final = frozenset({"lax", "strict", "none"})
+_COOKIE_NAME_RE: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_COOKIE_PATH_RE: Final = re.compile(r"^/[A-Za-z0-9/_-]*$")
 _HOST_RE: Final = re.compile(
     r"^(?:localhost|(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*)$"
 )
@@ -224,6 +227,50 @@ def _validate_webhook_url(url: str, *, production: bool) -> None:
         raise ConfigError("ORDER_WEBHOOK_URL contains an invalid port")
 
 
+def _validate_invoice_fields(source: Mapping[str, str]) -> None:
+    patterns = {
+        "SELLER_INN": r"(?:\d{10}|\d{12})",
+        "SELLER_KPP": r"\d{9}",
+        "SELLER_BIK": r"\d{9}",
+        "SELLER_CHECKING_ACCOUNT": r"\d{20}",
+        "SELLER_CORRESPONDENT_ACCOUNT": r"\d{20}",
+    }
+    for name, pattern in patterns.items():
+        value = _get(source, name)
+        if value and re.fullmatch(pattern, value) is None:
+            raise ConfigError(f"{name} has invalid format")
+    template = _get(source, "INVOICE_PAYMENT_PURPOSE_TEMPLATE")
+    if template:
+        try:
+            template.format(
+                invoice_number="INV-2026-000001",
+                invoice_date="01.01.2026",
+                order_id="test-order-id",
+            )
+        except (KeyError, ValueError, IndexError) as exc:
+            raise ConfigError(
+                "INVOICE_PAYMENT_PURPOSE_TEMPLATE contains an unsupported placeholder"
+            ) from exc
+
+
+def _validate_customer_order_page_url(value: str, *, production: bool) -> None:
+    parsed = urlsplit(value)
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ConfigError(
+            "CUSTOMER_ORDER_PAGE_URL must not contain credentials, query, or fragment"
+        )
+    if not parsed.scheme and not parsed.netloc:
+        if not value.startswith("/") or value.startswith("//"):
+            raise ConfigError(
+                "CUSTOMER_ORDER_PAGE_URL must be an absolute path or an http(s) URL"
+            )
+        return
+    allowed_schemes = {"https"} if production else {"http", "https"}
+    if parsed.scheme not in allowed_schemes or not parsed.hostname:
+        expected = "https" if production else "http(s)"
+        raise ConfigError(f"CUSTOMER_ORDER_PAGE_URL must be a valid {expected} URL")
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Typed runtime settings. Secrets are intentionally excluded from repr."""
@@ -243,6 +290,13 @@ class Settings:
     idempotency_ttl_seconds: int
     duplicate_window_seconds: int
     idempotency_key_max_length: int
+
+    customer_session_cookie_name: str
+    customer_session_ttl_seconds: int
+    customer_session_cookie_secure: bool
+    customer_session_cookie_samesite: str
+    customer_session_cookie_path: str
+    customer_order_page_url: str
 
     order_rate_limit_count: int
     order_rate_limit_window_seconds: int
@@ -272,6 +326,20 @@ class Settings:
     outbox_lock_seconds: int
     allow_store_only: bool
 
+    seller_legal_name: str | None
+    seller_inn: str | None
+    seller_kpp: str | None
+    seller_legal_address: str | None
+    seller_bank_name: str | None
+    seller_bik: str | None
+    seller_checking_account: str | None = field(repr=False)
+    seller_correspondent_account: str | None = field(repr=False)
+    seller_phone: str | None
+    seller_email: str | None
+    invoice_tax_text: str | None
+    invoice_payment_purpose_template: str | None
+    invoice_font_path: str
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
@@ -279,6 +347,23 @@ class Settings:
     @property
     def is_test(self) -> bool:
         return self.app_env == "test"
+
+    @property
+    def invoice_configured(self) -> bool:
+        return all(
+            (
+                self.seller_legal_name,
+                self.seller_inn,
+                self.seller_kpp,
+                self.seller_legal_address,
+                self.seller_bank_name,
+                self.seller_bik,
+                self.seller_checking_account,
+                self.seller_correspondent_account,
+                self.invoice_tax_text,
+                self.invoice_payment_purpose_template,
+            )
+        )
 
     def require_hash_secret(self) -> bytes:
         """Return the HMAC key or fail before privacy-sensitive hashing is attempted."""
@@ -358,6 +443,48 @@ class Settings:
         webhook_token = _get(source, "ORDER_WEBHOOK_TOKEN") or None
         outbox_enabled = _parse_bool(source, "OUTBOX_ENABLED", True)
         allow_store_only = _parse_bool(source, "ALLOW_STORE_ONLY", app_env != "production")
+        _validate_invoice_fields(source)
+        customer_cookie_name = _get(
+            source,
+            "CUSTOMER_SESSION_COOKIE_NAME",
+            "adrosta_customer_session",
+        )
+        if _COOKIE_NAME_RE.fullmatch(customer_cookie_name) is None:
+            raise ConfigError("CUSTOMER_SESSION_COOKIE_NAME has invalid format")
+        customer_cookie_samesite = _get(
+            source,
+            "CUSTOMER_SESSION_COOKIE_SAMESITE",
+            "lax",
+        ).casefold()
+        if customer_cookie_samesite not in _COOKIE_SAMESITE_VALUES:
+            raise ConfigError(
+                "CUSTOMER_SESSION_COOKIE_SAMESITE must be lax, strict, or none"
+            )
+        customer_cookie_path = _get(
+            source,
+            "CUSTOMER_SESSION_COOKIE_PATH",
+            "/api",
+        )
+        if _COOKIE_PATH_RE.fullmatch(customer_cookie_path) is None:
+            raise ConfigError("CUSTOMER_SESSION_COOKIE_PATH has invalid format")
+        customer_cookie_secure = _parse_bool(
+            source,
+            "CUSTOMER_SESSION_COOKIE_SECURE",
+            app_env == "production",
+        )
+        if customer_cookie_samesite == "none" and not customer_cookie_secure:
+            raise ConfigError(
+                "CUSTOMER_SESSION_COOKIE_SECURE must be true when SameSite=None"
+            )
+        customer_order_page_url = _get(
+            source,
+            "CUSTOMER_ORDER_PAGE_URL",
+            "/order",
+        )
+        _validate_customer_order_page_url(
+            customer_order_page_url,
+            production=app_env == "production",
+        )
 
         if webhook_enabled and not webhook_url:
             raise ConfigError("ORDER_WEBHOOK_URL is required when WEBHOOK_ENABLED=true")
@@ -391,6 +518,18 @@ class Settings:
             idempotency_key_max_length=_parse_int(
                 source, "IDEMPOTENCY_KEY_MAX_LENGTH", 128, minimum=16, maximum=200
             ),
+            customer_session_cookie_name=customer_cookie_name,
+            customer_session_ttl_seconds=_parse_int(
+                source,
+                "CUSTOMER_SESSION_TTL_SECONDS",
+                90 * 24 * 60 * 60,
+                minimum=60,
+                maximum=365 * 24 * 60 * 60,
+            ),
+            customer_session_cookie_secure=customer_cookie_secure,
+            customer_session_cookie_samesite=customer_cookie_samesite,
+            customer_session_cookie_path=customer_cookie_path,
+            customer_order_page_url=customer_order_page_url,
             order_rate_limit_count=_parse_int(
                 source, "ORDER_RATE_LIMIT_COUNT", 5, maximum=10_000
             ),
@@ -450,6 +589,29 @@ class Settings:
                 source, "OUTBOX_LOCK_SECONDS", 60, maximum=3_600
             ),
             allow_store_only=allow_store_only,
+            seller_legal_name=_get(source, "SELLER_LEGAL_NAME") or None,
+            seller_inn=_get(source, "SELLER_INN") or None,
+            seller_kpp=_get(source, "SELLER_KPP") or None,
+            seller_legal_address=_get(source, "SELLER_LEGAL_ADDRESS") or None,
+            seller_bank_name=_get(source, "SELLER_BANK_NAME") or None,
+            seller_bik=_get(source, "SELLER_BIK") or None,
+            seller_checking_account=(
+                _get(source, "SELLER_CHECKING_ACCOUNT") or None
+            ),
+            seller_correspondent_account=(
+                _get(source, "SELLER_CORRESPONDENT_ACCOUNT") or None
+            ),
+            seller_phone=_get(source, "SELLER_PHONE") or None,
+            seller_email=_get(source, "SELLER_EMAIL") or None,
+            invoice_tax_text=_get(source, "INVOICE_TAX_TEXT") or None,
+            invoice_payment_purpose_template=(
+                _get(source, "INVOICE_PAYMENT_PURPOSE_TEMPLATE") or None
+            ),
+            invoice_font_path=_get(
+                source,
+                "INVOICE_FONT_PATH",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ),
         )
         settings._validate_cross_field_rules()
         return settings
@@ -474,6 +636,10 @@ class Settings:
             raise ConfigError("DEBUG must be false in production")
         if self.api_docs_enabled:
             raise ConfigError("API_DOCS_ENABLED must be false in production")
+        if not self.customer_session_cookie_secure:
+            raise ConfigError(
+                "CUSTOMER_SESSION_COOKIE_SECURE must be true in production"
+            )
         if not self.cors_allowed_origins:
             raise ConfigError("CORS_ALLOWED_ORIGINS is required in production")
         if not self.allowed_hosts:
@@ -499,7 +665,12 @@ class Settings:
 def get_settings() -> Settings:
     """Load and cache process-wide settings."""
 
-    return Settings.from_env()
+    # Tests must be fully isolated from a developer's local dotenv file.  The
+    # test harness supplies every relevant value explicitly via the process
+    # environment or a Settings instance.
+    return Settings.from_env(
+        load_env_file=os.environ.get("APP_ENV", "").strip().casefold() != "test"
+    )
 
 
 def clear_settings_cache() -> None:

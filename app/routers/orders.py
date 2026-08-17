@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, Request, Response, status
 
 from app.schemas import OrderCreate, OrderResponse
 from app.security import resolve_client_ip
+from app.routers.customer import set_customer_session_cookie
 
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
@@ -51,8 +52,17 @@ def create_order(
         client_ip=client_ip,
         rate_limit_result=getattr(request.state, "rate_limit_result", None),
         rate_limit_error=getattr(request.state, "rate_limit_error", False),
+        customer_session_token=request.cookies.get(
+            context.settings.customer_session_cookie_name
+        ),
         request_id=getattr(request.state, "request_id", None),
     )
+    if outcome.customer_session_issue is not None:
+        set_customer_session_cookie(
+            response,
+            context.settings,
+            outcome.customer_session_issue,
+        )
     if outcome.replayed:
         response.status_code = status.HTTP_200_OK
         response.headers["Idempotency-Replayed"] = "true"

@@ -40,6 +40,7 @@ flowchart LR
     S -->|"SKU + boxes"| DB[("PostgreSQL: товары и price tiers")]
     S --> D["Единый domain calculator"]
     D -->|"рассчитанный snapshot"| O[("заказ, снимок товара, idempotency, outbox")]
+    O --> I[("immutable invoice snapshot + PDF BYTEA")]
     O --> A
     O --> W["Python worker"]
     W -->|"HTTPS webhook, повторные попытки"| X["Tilda / CRM / почтовый шлюз / другой сервис"]
@@ -53,6 +54,7 @@ flowchart LR
 | `app/config.py` | Типизированная загрузка и проверка env, строгие production-ограничения |
 | `app/schemas.py` | Строгий публичный контракт заказа, телефон/email и условные поля |
 | `app/routers/orders.py` | `POST /api/orders` |
+| `app/routers/customer.py` | Session-protected customer order, invoice PDF и logout endpoints |
 | `app/routers/cart.py` | Предварительный `POST /api/cart/calculate` без записи заказа |
 | `app/routers/health.py` | Liveness `GET /health` и readiness `GET /ready` |
 | `app/database.py`, `app/models.py` | SQLAlchemy engine/session и единый Declarative Base |
@@ -63,12 +65,14 @@ flowchart LR
 | `app/container.py` | Сборка зависимостей приложения и worker |
 | `app/integrations.py` | Тонкие HTTP-адаптеры: CDEK API v2 и универсальный webhook |
 | `app/cdek.py` | CDEK application service, package adapter и нормализация тарифов |
+| `app/invoice.py` | Immutable invoice snapshot, формат денег и offline PDF renderer |
 | `app/security.py` | HMAC-отпечатки, проверка idempotency key, доверенные proxy IP |
 | `app/errors.py` | Единый безопасный формат ошибок без отражения введённых данных |
 | `app/observability.py` | Request ID, метаданные запросов и ограничение размера тела без логирования PII |
 | `app/cli.py` | Управление PostgreSQL-каталогом Python-командами, без JSON-файлов |
-| `app/worker.py` | Доставка outbox-сообщений во внешний webhook |
-| `examples/tilda-api-client.js` | Изолированный клиент для подключения к существующему Tilda handler |
+| `app/worker.py` | Retry invoice generation и доставка order outbox во внешний webhook |
+| `examples/tilda-api-client.js` | Credentialed клиент для подключения к существующему Tilda handler |
+| `examples/tilda-order-page.html` | Автономный пример customer order page для блока Tilda T123 |
 | `tests/` | Маршрутные, валидационные и инфраструктурные тесты |
 | `Dockerfile` | Один непривилегированный API-процесс Uvicorn |
 
@@ -89,6 +93,7 @@ flowchart LR
 - надёжный PostgreSQL outbox с `FOR UPDATE SKIP LOCKED` и отдельный worker;
 - health/readiness, Swagger в development и Docker healthcheck.
 - CDEK API v2: поиск городов и обычных ПВЗ, OAuth и предварительный расчёт списка тарифов.
+- автоматический коммерческий счёт из сохранённого order snapshot, backend-нумерация, PDF и SHA-256.
 
 ### Что намеренно не реализовано без исходных данных
 
@@ -409,9 +414,41 @@ Frontend-поля `deliveryAmount`, `deliveryAmountKopecks`, `deliveryPrice`, `p
 
 Повтор уже сохранённого запроса с тем же `Idempotency-Key` возвращает snapshot заказа и не выполняет CDEK quote повторно. На этом этапе shipment, waybill и tracking в CDEK не создаются; это отдельный workflow после подтверждения оплаты/заказа.
 
+## Invoice Phase 1
+
+Для каждого нового коммерческого заказа backend в той же PostgreSQL-транзакции создаёт ровно один immutable invoice snapshot. Frontend не передаёт номер счёта, цены, totals, реквизиты продавца, налоговый текст, назначение платежа или PDF. Счёт использует только уже сохранённые данные заказа: buyer/company snapshot, строки `order_items`, `products_amount_kopecks`, `delivery_amount_kopecks` и `grand_total_kopecks`. Каталог и CDEK повторно не вызываются, поэтому последующее изменение цены или тарифа не меняет выданный счёт.
+
+Снимок хранится в `invoices`, строки — в `invoice_items`. Количество товара в строке выражено в фактических единицах (`шт.`), а не в коробках; unit price копируется из order item snapshot. При положительной стоимости СДЭК добавляется одна строка `Доставка СДЭК` с единицей `усл.`. Для бесплатного самовывоза нулевая строка доставки не создаётся.
+
+Номер имеет формат `INV-YYYY-NNNNNN`. Таблица `invoice_counters` выдаёт следующее значение атомарным PostgreSQL upsert внутри транзакции; `UNIQUE(invoice_number)` и `UNIQUE(order_id)` дополнительно гарантируют уникальность номера и правило «один заказ — один счёт». Повторный `Idempotency-Key` и повтор `ensure_invoice(order_id)` возвращают существующий снимок без обновления реквизитов, totals, строк или номера.
+
+PDF строится ReportLab без браузера, сети и удалённых assets. Кириллица и знак рубля рендерятся локальным DejaVu Sans; Docker устанавливает `fonts-dejavu-core`. PDF сохраняется прямо в PostgreSQL `BYTEA`, рядом хранится SHA-256, вычисленный по точным сохранённым bytes. Это изолировано в `InvoicePdfRenderer`/`InvoiceRepository`, поэтому storage можно заменить позже без изменения расчёта заказа.
+
+Lifecycle: `pending` создаётся вместе с order и durable outbox event `invoice.generate`; API после commit пытается сразу получить `generated`. Ошибка renderer не откатывает и не дублирует уже принятый order: событие остаётся для retry worker, а invoice получает `failed` до следующей попытки. Успешный retry записывает PDF и переводит invoice в `generated`; уже сгенерированный документ не перезаписывается.
+
+`INVOICE_TAX_TEXT` является только конфигурационной строкой и должен быть подтверждён бухгалтером — backend не определяет налоговый режим и не рассчитывает НДС. Поддерживаемые placeholders назначения платежа: `{invoice_number}`, `{invoice_date}`, `{order_id}`.
+
+PDF не имеет публичного угадываемого URL. Он выдаётся только через customer session endpoint, описанный ниже; запрос не пересчитывает заказ, не запускает renderer и не обращается к каталогу или CDEK.
+
 Для позиции заказа API принимает только `sku` и `boxes`. Поля цены, веса, объёма, размеров и клиентские totals будут отклонены как неизвестные. Общий предел коробок дополнительно задаёт `MAX_TOTAL_BOXES`.
 
-Успешное создание возвращает HTTP 201, `orderId`, `status=accepted`, `integrationStatus`, серверные позиции и totals. Коммерческие snapshot-поля (`unitsPerBox`, `units`, цены и `lineAmountKopecks`) вместе с весом, объёмом и грузовыми местами рассчитаны backend. Повтор того же запроса с тем же ключом возвращает сохранённый результат с HTTP 200, `replayed=true` и заголовком `Idempotency-Replayed: true`.
+Успешное создание возвращает HTTP 201, совместимый прежний `orderId`, новый отображаемый `orderNumber`, `orderPageUrl`, `status=accepted`, `integrationStatus`, серверные позиции и totals. Коммерческие snapshot-поля (`unitsPerBox`, `units`, цены и `lineAmountKopecks`) вместе с весом, объёмом и грузовыми местами рассчитаны backend. Повтор того же запроса с тем же ключом возвращает сохранённый результат с HTTP 200, `replayed=true` и заголовком `Idempotency-Replayed: true`.
+
+## Customer Access Phase 1
+
+При первом успешном `POST /api/orders` backend генерирует непрозрачный token через `secrets.token_urlsafe(32)` (256 бит энтропии), сохраняет только его SHA-256 hash в `customer_sessions` и устанавливает host-only cookie `adrosta_customer_session`. Cookie имеет `HttpOnly`, ограниченный `Path=/api`, настраиваемый fixed TTL (по умолчанию 90 дней) и `SameSite=Lax`; production-конфигурация запрещает `Secure=false`. Raw token отсутствует в JSON, URL, idempotency records, outbox и PostgreSQL.
+
+Связь `customer_session_orders` выдаёт одной browser session доступ к нескольким созданным ею заказам. Новый order, items, invoice snapshot, outbox/idempotency и session grant записываются одной транзакцией. Формат отображаемого номера — `AD-YYYY-NNNNNN`; годовой счётчик обновляется атомарным upsert, но сам номер не является авторизацией.
+
+Защищённые endpoints:
+
+- `GET /api/customer/orders/{order_number}` — customer-safe snapshot без database ID, buyer PII, idempotency/outbox и служебных полей;
+- `GET /api/customer/orders/{order_number}/invoice.pdf?disposition=inline|attachment` — уже сохранённые immutable PDF bytes;
+- `POST /api/customer/session/logout` — отзыв текущей session и очистка cookie.
+
+Отсутствующая, неизвестная, истёкшая, отозванная или чужая session, а также неизвестный номер дают одинаковый `404 ORDER_NOT_AVAILABLE`. `last_used_at` обновляется не чаще одного раза в час. Повтор по `Idempotency-Key` не создаёт новый order/invoice/session; новая или чужая session при replay не получает grant. Поэтому потерянную cookie нельзя восстановить одним знанием idempotency key — recovery через email/SMS OTP остаётся задачей Phase 2.
+
+Customer API возвращает только номер/дату/статус заказа, безопасные строки товаров и totals, краткое описание доставки, номер/дату invoice и `pdfAvailable`. Телефон, email, ИНН, КПП, полный адрес, внутренние UUID и integration identifiers не возвращаются.
 
 Статусы интеграции:
 
@@ -425,17 +462,18 @@ Frontend-поля `deliveryAmount`, `deliveryAmountKopecks`, `deliveryPrice`, `p
 | HTTP | Коды/причины |
 |---:|---|
 | 400 | `IDEMPOTENCY_KEY_REQUIRED`, некорректный запрос |
+| 404 | `ORDER_NOT_AVAILABLE` для любого недоступного customer order/invoice |
 | 409 | `DUPLICATE_ORDER`, `IDEMPOTENCY_CONFLICT` |
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `VALIDATION_ERROR`, `UNKNOWN_SKU` |
 | 429 | `RATE_LIMITED`; время ожидания есть в `Retry-After` |
-| 503 | `PRICE_TIER_NOT_FOUND`, `CATALOG_UNAVAILABLE` или `SERVICE_UNAVAILABLE` |
+| 503 | `PRICE_TIER_NOT_FOUND`, `CATALOG_UNAVAILABLE`, `INVOICE_NOT_CONFIGURED`, `INVOICE_GENERATION_FAILED` или `SERVICE_UNAVAILABLE` |
 
 Не показывайте ответ через `innerHTML`; используйте `textContent`. Передавая `requestId` поддержке, пользователь не раскрывает содержимое заказа.
 
 ## Подключение существующей формы Tilda
 
-В архиве не было кода формы, поэтому `examples/tilda-api-client.js` не ищет поля, не нажимает нативную кнопку Tilda и не меняет уже работающий `MutationObserver`. Это самостоятельный транспортный слой, который нужно вызвать из существующего handler после его клиентской валидации.
+В архиве не было кода формы, поэтому `examples/tilda-api-client.js` не ищет поля, не нажимает нативную кнопку Tilda и не меняет уже работающий `MutationObserver`. Это самостоятельный транспортный слой, который нужно вызвать из существующего handler после его клиентской валидации. Его fetch использует `credentials: "include"`, чтобы браузер принял и продолжал HttpOnly customer cookie.
 
 Пример подключения (URL — заполнитель, его нужно заменить реальным HTTPS API):
 
@@ -472,6 +510,10 @@ Frontend-поля `deliveryAmount`, `deliveryAmountKopecks`, `deliveryPrice`, `p
 - при неясном результате сети повторяется `submit` того же `orderSubmission`, а не создаётся новый;
 - DOM-селекторы, `MutationObserver`, таймаут 4500 мс и снятие маски/`required` остаются в существующем коде формы и здесь не дублируются.
 
+Для страницы заказа скопируйте содержимое `examples/tilda-order-page.html` в HTML-код блока Tilda T123, замените единственный placeholder `API_BASE`, а страницу опубликуйте по URL из `CUSTOMER_ORDER_PAGE_URL`. Пример читает только публичный `number` из query string, делает credentialed request, создаёт DOM через `textContent`/`createElement` и показывает защищённые ссылки просмотра/скачивания invoice. В `localStorage` он сохраняет только `last_order_number`; session token остаётся недоступен JavaScript.
+
+Для production Tilda и API должны работать через HTTPS. При `adrosta.ru` → `api.adrosta.ru` они остаются same-site, поэтому `SameSite=Lax` подходит. В `CORS_ALLOWED_ORIGINS` перечислите каждый реальный origin отдельно, например `https://adrosta.ru,https://www.adrosta.ru`; wildcard и отражение произвольного `Origin` запрещены. Preview-origin добавляйте только если он действительно используется и доверен.
+
 ## Переменные окружения
 
 Скопируйте `.env.example` в `.env`. Реальные секреты не коммитятся и не передаются во frontend.
@@ -491,6 +533,12 @@ Frontend-поля `deliveryAmount`, `deliveryAmountKopecks`, `deliveryPrice`, `p
 | `IDEMPOTENCY_TTL_SECONDS` | Срок хранения результата ключа |
 | `DUPLICATE_WINDOW_SECONDS` | Окно обнаружения одинакового заказа с другим ключом |
 | `IDEMPOTENCY_KEY_MAX_LENGTH` | Максимальная длина заголовка |
+| `CUSTOMER_SESSION_COOKIE_NAME` | Имя HttpOnly cookie; по умолчанию `adrosta_customer_session` |
+| `CUSTOMER_SESSION_TTL_SECONDS` | Fixed lifetime session; по умолчанию 7776000 секунд (90 дней) |
+| `CUSTOMER_SESSION_COOKIE_SECURE` | В production обязательно `true`; local/test может быть `false` |
+| `CUSTOMER_SESSION_COOKIE_SAMESITE` | `lax`, `strict` или `none`; `none` требует Secure |
+| `CUSTOMER_SESSION_COOKIE_PATH` | Ограниченный cookie path, по умолчанию `/api` |
+| `CUSTOMER_ORDER_PAGE_URL` | Относительный `/order` или HTTPS URL опубликованной Tilda-страницы без query |
 | `ORDER_RATE_LIMIT_COUNT` | Число запросов одного IP в окне |
 | `ORDER_RATE_LIMIT_WINDOW_SECONDS` | Длина rate-limit окна |
 | `MAX_REQUEST_BODY_BYTES` | Максимальный размер тела запроса |
@@ -503,6 +551,13 @@ Frontend-поля `deliveryAmount`, `deliveryAmountKopecks`, `deliveryPrice`, `p
 | `CDEK_FROM_CITY_CODE` | Код города отправления ADROSTA в справочнике CDEK |
 | `CDEK_ORIGIN_MODE` | `warehouse` (ADROSTA сдаёт груз) или `door` (забор курьером) |
 | `CDEK_HTTP_TIMEOUT_SECONDS` | Таймаут каждого запроса к CDEK, 0.1–60 секунд |
+| `SELLER_LEGAL_NAME`, `SELLER_INN`, `SELLER_KPP`, `SELLER_LEGAL_ADDRESS` | Подтверждённые бухгалтером реквизиты продавца для нового invoice snapshot |
+| `SELLER_BANK_NAME`, `SELLER_BIK` | Банк продавца и БИК |
+| `SELLER_CHECKING_ACCOUNT`, `SELLER_CORRESPONDENT_ACCOUNT` | Расчётный и корреспондентский счета; server-side only |
+| `SELLER_PHONE`, `SELLER_EMAIL` | Необязательные контакты продавца в счёте |
+| `INVOICE_TAX_TEXT` | Утверждённая бухгалтером налоговая формулировка; backend её не вычисляет |
+| `INVOICE_PAYMENT_PURPOSE_TEMPLATE` | Назначение платежа с разрешёнными placeholders номера, даты и order ID |
+| `INVOICE_FONT_PATH` | Локальный TTF с кириллицей; Docker использует DejaVu Sans |
 | `WEBHOOK_ENABLED` | Включить внешний server-to-server webhook |
 | `ORDER_WEBHOOK_URL` | Реальный URL получателя; в production только HTTPS, без query-токенов |
 | `ORDER_WEBHOOK_TOKEN` | Bearer token получателя; обязателен для production webhook |
@@ -517,9 +572,9 @@ Frontend-поля `deliveryAmount`, `deliveryAmountKopecks`, `deliveryPrice`, `p
 
 Production-конфигурация проверяется при старте. Runtime принимает только драйвер `postgresql+psycopg`; wildcard CORS, слабый секрет, HTTP webhook, включённый debug/docs и противоречивые outbox-настройки приводят к отказу запуска. Не помещайте пароль базы в логи или frontend.
 
-## Webhook worker
+## Outbox worker
 
-При `WEBHOOK_ENABLED=true` API сохраняет заказ и событие `order.created` в одной транзакции и сразу отвечает браузеру. Внешняя недоступность не теряет принятый заказ: worker повторяет доставку с экспоненциальной задержкой и отмечает окончательный результат в outbox.
+API сохраняет invoice job `invoice.generate` в той же транзакции, что order и invoice snapshot. Worker безопасно повторяет PDF generation после сбоя API/renderer. При `WEBHOOK_ENABLED=true` в той же транзакции также создаётся `order.created`; внешняя недоступность не теряет принятый заказ, а worker повторяет доставку с экспоненциальной задержкой.
 
 ```powershell
 # Постоянный процесс рядом с API
@@ -529,7 +584,7 @@ python -m app.worker
 python -m app.worker --once
 ```
 
-Worker отправляет полный сохранённый заказ, доверенные totals и снимки товаров методом POST. Заголовок `Idempotency-Key` равен `orderId`; при наличии токена используется `Authorization: Bearer …`. Получатель обязан безопасно обрабатывать повтор одного `orderId`. Тела ошибок внешнего сервиса не сохраняются и не логируются.
+Для `invoice.generate` worker не обращается к каталогу, CDEK или внешней сети. Для `order.created` он отправляет полный сохранённый заказ, доверенные totals и снимки товаров методом POST. Заголовок `Idempotency-Key` равен `orderId`; при наличии токена используется `Authorization: Bearer …`. Получатель обязан безопасно обрабатывать повтор одного `orderId`. Тела ошибок внешнего сервиса не сохраняются и не логируются.
 
 Точный контракт конкретной CRM/Tilda/email API неизвестен. Если её формат отличается, нужен отдельный server-side adapter в `app/integrations.py`; секрет всё равно остаётся только на backend.
 
@@ -587,7 +642,8 @@ python -m alembic check
 - безопасный повтор с тем же idempotency key, конфликт ключа и дубликат с новым ключом;
 - rate limit и ограничение размера запроса;
 - недоступность/отказ webhook, retry и окончательный статус outbox;
-- строгий CORS и отсутствие секретов в клиентском файле.
+- credentialed CORS только для точных origins и отсутствие секретов в клиентском файле;
+- hash-only customer sessions, grants, одинаковый отказ для чужого/неизвестного заказа и защищённый PDF.
 
 ## Docker Compose и PostgreSQL
 
@@ -630,13 +686,14 @@ API и при включённом webhook отдельный `python -m app.wor
 5. Внести точные опубликованные Tilda origins в `CORS_ALLOWED_ORIGINS`; отдельно перечислить API hostname и healthcheck IP в `ALLOWED_HOSTS`.
 6. Если reverse proxy передаёт `X-Forwarded-For`, внести только его реальные IP/CIDR в `TRUSTED_PROXY_IPS`.
 7. Загрузить все реальные активные SKU через `python -m app.cli product upsert` и сверить граммы/миллиметры с источником данных.
-8. Выбрать режим: настроить реальный HTTPS webhook и worker либо осознанно включить `ALLOW_STORE_ONLY=true`.
-9. Выполнить тесты, затем проверить `/health` и `/ready` на целевом окружении.
-10. Настроить PostgreSQL backup (`pg_dump`/управляемые snapshots), retention и регулярный тест восстановления.
-11. Настроить мониторинг HTTP 5xx, `not_ready`, падения worker и сообщений outbox со статусом `failed`.
-12. Определить срок хранения PII, доступ операторов и процедуру удаления/выгрузки заказов.
-13. Разместить версионированный `examples/tilda-api-client.js`, встроить вызов в существующий handler и опубликовать страницу Tilda.
-14. Сделать реальный тест физлица и юрлица, проверить заказ в PostgreSQL и в конечном внешнем сервисе.
+8. Заполнить только подтверждённые бухгалтером `SELLER_*`, `INVOICE_TAX_TEXT` и payment purpose; проверить наличие локального invoice font.
+9. Запустить worker для recoverable invoice generation; выбрать режим webhook либо осознанно включить `ALLOW_STORE_ONLY=true`.
+10. Выполнить тесты, затем проверить `/health` и `/ready` на целевом окружении.
+11. Настроить PostgreSQL backup (`pg_dump`/управляемые snapshots), retention и регулярный тест восстановления.
+12. Настроить мониторинг HTTP 5xx, `not_ready`, падения worker и сообщений outbox со статусом `failed`.
+13. Определить срок хранения PII, доступ операторов и процедуру удаления/выгрузки заказов.
+14. Разместить версионированный `examples/tilda-api-client.js`, встроить вызов в существующий handler и опубликовать страницу Tilda.
+15. Сделать реальный тест физлица и business-покупателя, проверить заказ и invoice в PostgreSQL.
 
 ## Что нужно предоставить/настроить вручную
 
@@ -645,6 +702,7 @@ API и при включённом webhook отдельный `python -m app.wor
 - список SKU с названием, весом одной коробки и тремя габаритами;
 - выбранный PostgreSQL-хостинг, backup/restore, reverse proxy и его доверенные IP;
 - назначение заявки: только PostgreSQL или конкретная Tilda/CRM/email система;
+- подтверждённые бухгалтером реквизиты продавца, налоговый текст и назначение платежа;
 - URL, способ авторизации и ожидаемый контракт внешнего получателя;
 - решение, должна ли после успеха backend дополнительно срабатывать текущая нативная отправка Tilda;
 - политика хранения персональных данных, резервного копирования и доступа.

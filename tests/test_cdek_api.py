@@ -12,7 +12,12 @@ from app.cdek import (
     millimetres_to_cdek_centimetres,
     rubles_to_kopecks,
 )
-from app.integrations import CdekTimeoutError, CdekUnavailableError
+from app.integrations import (
+    CdekAuthError,
+    CdekBadResponseError,
+    CdekTimeoutError,
+    CdekUnavailableError,
+)
 from app.repositories import Product, ProductPriceTier
 from app.schemas import CdekDeliveryType
 
@@ -267,6 +272,8 @@ def test_frontend_cannot_supply_physical_package_data(cdek_app) -> None:
 @pytest.mark.parametrize(
     ("error", "status_code", "code"),
     [
+        (CdekAuthError("CDEK_AUTH_ERROR"), 502, "CDEK_AUTH_ERROR"),
+        (CdekBadResponseError("CDEK_BAD_RESPONSE"), 502, "CDEK_BAD_RESPONSE"),
         (CdekUnavailableError("CDEK_UNAVAILABLE"), 503, "CDEK_UNAVAILABLE"),
         (CdekTimeoutError("CDEK_TIMEOUT"), 504, "CDEK_TIMEOUT"),
     ],
