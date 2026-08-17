@@ -540,6 +540,7 @@ class CustomerOrderDeliveryResponse(ApiModel):
 class CustomerInvoiceResponse(ApiModel):
     number: str
     issued_at: datetime
+    status: Literal["pending", "generated", "failed"]
     pdf_available: bool
 
 

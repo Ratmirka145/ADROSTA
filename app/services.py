@@ -33,6 +33,7 @@ from app.errors import (
     IdempotencyKeyRequiredError,
     InvoiceGenerationFailedError,
     InvoiceNotConfiguredError,
+    InvoiceNotReadyError,
     RateLimitError,
     PriceTierNotFoundError,
     ServiceUnavailableError,
@@ -140,10 +141,15 @@ class CustomerAccessService:
             return None, lookup.session_valid
         record = lookup.order
         invoice = None
-        if record.invoice_number is not None and record.invoice_issued_at is not None:
+        if (
+            record.invoice_number is not None
+            and record.invoice_issued_at is not None
+            and record.invoice_status is not None
+        ):
             invoice = CustomerInvoiceResponse(
                 number=record.invoice_number,
                 issued_at=datetime.fromtimestamp(record.invoice_issued_at, UTC),
+                status=record.invoice_status,
                 pdf_available=record.invoice_pdf_available,
             )
         return (
@@ -197,6 +203,10 @@ class CustomerAccessService:
         except SQLAlchemyError:
             raise ServiceUnavailableError() from None
         if lookup.invoice is None:
+            if lookup.order_authorized:
+                if lookup.invoice_status == "generated":
+                    raise ServiceUnavailableError()
+                raise InvoiceNotReadyError()
             return None, lookup.session_valid
         invoice = lookup.invoice
         actual_digest = hashlib.sha256(invoice.pdf_bytes).hexdigest()

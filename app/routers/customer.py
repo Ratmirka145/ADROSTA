@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
 
-from fastapi import APIRouter, Query, Request, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from starlette.responses import Response as StarletteResponse
 
 from app.config import Settings
@@ -76,6 +76,7 @@ def get_customer_order(
     responses={
         200: {"content": {"application/pdf": {}}},
         404: {"description": "Заказ или счёт недоступен"},
+        409: {"description": "Счёт владельца заказа ещё не готов"},
         503: {"description": "Хранилище временно недоступно"},
     },
 )
@@ -114,6 +115,9 @@ def get_customer_invoice_pdf(
 )
 def logout_customer_session(request: Request, response: Response) -> None:
     context = request.app.state.context
+    origin = request.headers.get("Origin")
+    if origin is None or origin not in context.settings.cors_allowed_origins:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     token = request.cookies.get(context.settings.customer_session_cookie_name)
     context.customer_access_service.logout(token)
     clear_customer_session_cookie(response, context.settings)

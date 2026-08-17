@@ -44,7 +44,7 @@ from app.models import (
     ProductPriceTierModel,
     RateLimitWindowModel,
 )
-from app.invoice import InvoiceDraft, InvoiceItemDraft, InvoiceSnapshot
+from app.invoice import InvoiceDraft, InvoiceItemDraft, InvoiceSnapshot, InvoiceStatus
 
 
 _MAX_BIGINT = 9_223_372_036_854_775_807
@@ -320,6 +320,7 @@ class CustomerOrderRecord:
     cdek_period_max_days: int | None
     invoice_number: str | None
     invoice_issued_at: int | None
+    invoice_status: InvoiceStatus | None
     invoice_pdf_available: bool
     items: tuple[CustomerOrderItemRecord, ...]
 
@@ -341,6 +342,8 @@ class CustomerOrderLookup:
 @dataclass(frozen=True)
 class CustomerInvoiceLookup:
     session_valid: bool
+    order_authorized: bool = False
+    invoice_status: InvoiceStatus | None = None
     invoice: CustomerInvoicePdfRecord | None = None
 
 
@@ -1239,6 +1242,9 @@ class CustomerSessionRepository:
                     cdek_period_max_days=order.cdek_period_max_days,
                     invoice_number=invoice.invoice_number if invoice else None,
                     invoice_issued_at=invoice.issued_at if invoice else None,
+                    invoice_status=(
+                        cast(InvoiceStatus, invoice.status) if invoice else None
+                    ),
                     invoice_pdf_available=(
                         invoice is not None
                         and invoice.status == "generated"
@@ -1277,26 +1283,44 @@ class CustomerSessionRepository:
             )
             if session_row is None:
                 return CustomerInvoiceLookup(session_valid=False)
-            row = session.execute(
-                select(OrderModel.order_number, InvoiceModel)
+            order = session.execute(
+                select(OrderModel.id, OrderModel.order_number)
                 .join(
                     CustomerSessionOrderModel,
                     CustomerSessionOrderModel.order_id == OrderModel.id,
                 )
-                .join(InvoiceModel, InvoiceModel.order_id == OrderModel.id)
                 .where(
                     CustomerSessionOrderModel.session_id == session_row.id,
                     OrderModel.order_number == order_number,
-                    InvoiceModel.status == "generated",
                 )
             ).one_or_none()
-            if row is None:
+            if order is None:
                 return CustomerInvoiceLookup(session_valid=True)
-            stored_order_number, invoice = row
+            order_id, stored_order_number = order
+            invoice = session.scalar(
+                select(InvoiceModel).where(InvoiceModel.order_id == order_id)
+            )
+            if invoice is None:
+                return CustomerInvoiceLookup(
+                    session_valid=True,
+                    order_authorized=True,
+                )
+            if invoice.status != "generated":
+                return CustomerInvoiceLookup(
+                    session_valid=True,
+                    order_authorized=True,
+                    invoice_status=cast(InvoiceStatus, invoice.status),
+                )
             if invoice.pdf_content is None or invoice.pdf_sha256 is None:
-                return CustomerInvoiceLookup(session_valid=True)
+                return CustomerInvoiceLookup(
+                    session_valid=True,
+                    order_authorized=True,
+                    invoice_status=cast(InvoiceStatus, invoice.status),
+                )
             return CustomerInvoiceLookup(
                 session_valid=True,
+                order_authorized=True,
+                invoice_status=cast(InvoiceStatus, invoice.status),
                 invoice=CustomerInvoicePdfRecord(
                     order_number=stored_order_number,
                     invoice_number=invoice.invoice_number,

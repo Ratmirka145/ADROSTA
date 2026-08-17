@@ -333,6 +333,7 @@ def test_postgresql_customer_session_hash_grant_order_and_pdf(postgres_app) -> N
     assert created.status_code == 201
     assert customer_order.status_code == 200
     assert customer_order.json()["orderNumber"] == order_number
+    assert customer_order.json()["invoice"]["status"] == "generated"
     assert pdf.status_code == 200
     assert pdf.content.startswith(b"%PDF")
     with context.database.session() as session:

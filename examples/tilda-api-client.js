@@ -389,7 +389,13 @@
         if (!response.ok) {
           throw errorFromResponse(response, body);
         }
-        if (!body || typeof body !== "object" || typeof body.orderId !== "string") {
+        if (
+          !body ||
+          typeof body !== "object" ||
+          typeof body.orderId !== "string" ||
+          typeof body.orderNumber !== "string" ||
+          typeof body.orderPageUrl !== "string"
+        ) {
           throw new AdrostaOrderError({
             code: "INVALID_SERVER_RESPONSE",
             status: response.status,

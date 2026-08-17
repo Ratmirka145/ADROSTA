@@ -53,6 +53,7 @@ class ErrorCode(str, Enum):
     CDEK_TARIFF_UNAVAILABLE = "CDEK_TARIFF_UNAVAILABLE"
     CDEK_OFFICE_UNAVAILABLE = "CDEK_OFFICE_UNAVAILABLE"
     ORDER_NOT_AVAILABLE = "ORDER_NOT_AVAILABLE"
+    INVOICE_NOT_READY = "INVOICE_NOT_READY"
     BAD_REQUEST = "BAD_REQUEST"
     UNAUTHORIZED = "UNAUTHORIZED"
     FORBIDDEN = "FORBIDDEN"
@@ -340,6 +341,15 @@ class OrderNotAvailableError(AppError):
             ErrorCode.ORDER_NOT_AVAILABLE,
             "Заказ недоступен.",
             status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class InvoiceNotReadyError(AppError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.INVOICE_NOT_READY,
+            "Счёт пока не готов.",
+            status_code=status.HTTP_409_CONFLICT,
         )
 
 
@@ -747,6 +757,7 @@ __all__ = [
     "IdempotencyKeyRequiredError",
     "InvoiceGenerationFailedError",
     "InvoiceNotConfiguredError",
+    "InvoiceNotReadyError",
     "OrderInProgressError",
     "OrderNotAvailableError",
     "PayloadTooLargeError",

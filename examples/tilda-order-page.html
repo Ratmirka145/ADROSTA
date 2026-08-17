@@ -39,8 +39,12 @@
 
   var API_BASE = "https://api.example.test"; // Replace with the ADROSTA API origin.
   var ORDER_NUMBER_PATTERN = /^AD-\d{4}-\d{6}$/;
+  var INVOICE_POLL_INTERVAL_MS = 4000;
+  var INVOICE_POLL_MAX_ATTEMPTS = 15;
   var state = document.getElementById("adrosta-order-state");
   var content = document.getElementById("adrosta-order-content");
+  var invoicePollAttempts = 0;
+  var invoicePollTimer = null;
 
   function setState(message) {
     state.textContent = message;
@@ -99,6 +103,43 @@
     target.appendChild(amount);
   }
 
+  function renderInvoice(order) {
+    var invoiceSection = document.getElementById("adrosta-order-invoice");
+    var invoiceInfo = document.getElementById("adrosta-invoice-info");
+    var viewLink = document.getElementById("adrosta-invoice-view");
+    var downloadLink = document.getElementById("adrosta-invoice-download");
+    viewLink.hidden = true;
+    downloadLink.hidden = true;
+    viewLink.removeAttribute("href");
+    downloadLink.removeAttribute("href");
+
+    if (!order.invoice) {
+      invoiceSection.hidden = true;
+      return "failed";
+    }
+
+    invoiceSection.hidden = false;
+    if (order.invoice.status === "generated" && order.invoice.pdfAvailable) {
+      invoiceInfo.textContent =
+        "Счёт " + order.invoice.number + " от " + dateTime(order.invoice.issuedAt) +
+        " готов.";
+      var pdfBase = API_BASE + "/api/customer/orders/" +
+        encodeURIComponent(order.orderNumber) + "/invoice.pdf";
+      viewLink.href = pdfBase + "?disposition=inline";
+      downloadLink.href = pdfBase + "?disposition=attachment";
+      viewLink.hidden = false;
+      downloadLink.hidden = false;
+      return "generated";
+    }
+    if (order.invoice.status === "failed") {
+      invoiceInfo.textContent =
+        "Счёт временно не удалось подготовить. Попробуйте обновить страницу позже.";
+      return "failed";
+    }
+    invoiceInfo.textContent = "Счёт готовится…";
+    return "pending";
+  }
+
   function renderOrder(order) {
     document.getElementById("adrosta-order-number").textContent =
       "Заказ " + order.orderNumber;
@@ -116,23 +157,7 @@
     document.getElementById("adrosta-order-delivery").textContent =
       order.delivery.description;
 
-    var invoiceSection = document.getElementById("adrosta-order-invoice");
-    if (order.invoice) {
-      document.getElementById("adrosta-invoice-info").textContent =
-        "Счёт " + order.invoice.number + " от " + dateTime(order.invoice.issuedAt);
-      invoiceSection.hidden = false;
-      if (order.invoice.pdfAvailable) {
-        var pdfBase = API_BASE + "/api/customer/orders/" +
-          encodeURIComponent(order.orderNumber) + "/invoice.pdf";
-        document.getElementById("adrosta-invoice-view").href =
-          pdfBase + "?disposition=inline";
-        document.getElementById("adrosta-invoice-download").href =
-          pdfBase + "?disposition=attachment";
-      } else {
-        document.getElementById("adrosta-invoice-view").hidden = true;
-        document.getElementById("adrosta-invoice-download").hidden = true;
-      }
-    }
+    var invoiceStatus = renderInvoice(order);
 
     try {
       window.localStorage.setItem("last_order_number", order.orderNumber);
@@ -141,6 +166,56 @@
     }
     state.hidden = true;
     content.hidden = false;
+    return invoiceStatus;
+  }
+
+  function scheduleInvoicePoll(number) {
+    if (invoicePollTimer !== null) {
+      return;
+    }
+    if (invoicePollAttempts >= INVOICE_POLL_MAX_ATTEMPTS) {
+      document.getElementById("adrosta-invoice-info").textContent =
+        "Счёт всё ещё готовится. Обновите страницу позже.";
+      return;
+    }
+    invoicePollTimer = window.setTimeout(function pollInvoice() {
+      invoicePollTimer = null;
+      invoicePollAttempts += 1;
+      loadOrder(number, true);
+    }, INVOICE_POLL_INTERVAL_MS);
+  }
+
+  function loadOrder(number, isPolling) {
+    fetch(API_BASE + "/api/customer/orders/" + encodeURIComponent(number), {
+      method: "GET",
+      mode: "cors",
+      credentials: "include",
+      cache: "no-store",
+      headers: { "Accept": "application/json" }
+    }).then(function handleResponse(response) {
+      if (response.status === 404) {
+        throw { customerMessage: "Заказ недоступен в этом браузере." };
+      }
+      if (!response.ok) {
+        throw { customerMessage: "Сервис временно недоступен. Попробуйте позже." };
+      }
+      return response.json();
+    }).then(function handleOrder(order) {
+      var invoiceStatus = renderOrder(order);
+      if (invoiceStatus === "pending") {
+        scheduleInvoicePoll(number);
+      }
+    }).catch(function handleError(error) {
+      var message = error && error.customerMessage
+        ? error.customerMessage
+        : "Не удалось загрузить заказ. Проверьте соединение и повторите попытку.";
+      if (isPolling) {
+        document.getElementById("adrosta-invoice-info").textContent = message;
+        scheduleInvoicePoll(number);
+      } else {
+        setState(message);
+      }
+    });
   }
 
   var number = new URLSearchParams(window.location.search).get("number");
@@ -149,24 +224,6 @@
     return;
   }
 
-  fetch(API_BASE + "/api/customer/orders/" + encodeURIComponent(number), {
-    method: "GET",
-    mode: "cors",
-    credentials: "include",
-    cache: "no-store",
-    headers: { "Accept": "application/json" }
-  }).then(function handleResponse(response) {
-    if (response.status === 404) {
-      throw { customerMessage: "Заказ недоступен в этом браузере." };
-    }
-    if (!response.ok) {
-      throw { customerMessage: "Сервис временно недоступен. Попробуйте позже." };
-    }
-    return response.json();
-  }).then(renderOrder).catch(function handleError(error) {
-    setState(error && error.customerMessage
-      ? error.customerMessage
-      : "Не удалось загрузить заказ. Проверьте соединение и повторите попытку.");
-  });
+  loadOrder(number, false);
 })();
 </script>

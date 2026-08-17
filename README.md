@@ -444,11 +444,11 @@ PDF не имеет публичного угадываемого URL. Он вы
 
 - `GET /api/customer/orders/{order_number}` — customer-safe snapshot без database ID, buyer PII, idempotency/outbox и служебных полей;
 - `GET /api/customer/orders/{order_number}/invoice.pdf?disposition=inline|attachment` — уже сохранённые immutable PDF bytes;
-- `POST /api/customer/session/logout` — отзыв текущей session и очистка cookie.
+- `POST /api/customer/session/logout` — отзыв текущей session и очистка cookie; запрос требует точный `Origin` из `CORS_ALLOWED_ORIGINS`.
 
 Отсутствующая, неизвестная, истёкшая, отозванная или чужая session, а также неизвестный номер дают одинаковый `404 ORDER_NOT_AVAILABLE`. `last_used_at` обновляется не чаще одного раза в час. Повтор по `Idempotency-Key` не создаёт новый order/invoice/session; новая или чужая session при replay не получает grant. Поэтому потерянную cookie нельзя восстановить одним знанием idempotency key — recovery через email/SMS OTP остаётся задачей Phase 2.
 
-Customer API возвращает только номер/дату/статус заказа, безопасные строки товаров и totals, краткое описание доставки, номер/дату invoice и `pdfAvailable`. Телефон, email, ИНН, КПП, полный адрес, внутренние UUID и integration identifiers не возвращаются.
+Customer API возвращает только номер/дату/статус заказа, безопасные строки товаров и totals, краткое описание доставки, номер/дату invoice, его статус `pending`, `generated` или `failed` и `pdfAvailable`. Телефон, email, ИНН, КПП, полный адрес, внутренние UUID и integration identifiers не возвращаются. Владелец grant получает `409 INVOICE_NOT_READY`, если PDF ещё не сформирован; запрос без доступа по-прежнему получает неотличимый `404 ORDER_NOT_AVAILABLE`.
 
 Статусы интеграции:
 
@@ -463,7 +463,7 @@ Customer API возвращает только номер/дату/статус 
 |---:|---|
 | 400 | `IDEMPOTENCY_KEY_REQUIRED`, некорректный запрос |
 | 404 | `ORDER_NOT_AVAILABLE` для любого недоступного customer order/invoice |
-| 409 | `DUPLICATE_ORDER`, `IDEMPOTENCY_CONFLICT` |
+| 409 | `DUPLICATE_ORDER`, `IDEMPOTENCY_CONFLICT`, `INVOICE_NOT_READY` для владельца заказа |
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `VALIDATION_ERROR`, `UNKNOWN_SKU` |
 | 429 | `RATE_LIMITED`; время ожидания есть в `Retry-After` |
@@ -486,7 +486,8 @@ Customer API возвращает только номер/дату/статус 
       // Здесь включить/выключить уже существующий loader и кнопку.
     },
     onSuccess: function (result) {
-      // Здесь показать успех или продолжить существующую нативную отправку Tilda.
+      // После необходимых действий существующего handler перейти на страницу заказа.
+      window.location.assign(result.orderPageUrl);
     },
     onError: function (error) {
       // Показать error.message через textContent; сохранить error.requestId для поддержки.
@@ -510,7 +511,7 @@ Customer API возвращает только номер/дату/статус 
 - при неясном результате сети повторяется `submit` того же `orderSubmission`, а не создаётся новый;
 - DOM-селекторы, `MutationObserver`, таймаут 4500 мс и снятие маски/`required` остаются в существующем коде формы и здесь не дублируются.
 
-Для страницы заказа скопируйте содержимое `examples/tilda-order-page.html` в HTML-код блока Tilda T123, замените единственный placeholder `API_BASE`, а страницу опубликуйте по URL из `CUSTOMER_ORDER_PAGE_URL`. Пример читает только публичный `number` из query string, делает credentialed request, создаёт DOM через `textContent`/`createElement` и показывает защищённые ссылки просмотра/скачивания invoice. В `localStorage` он сохраняет только `last_order_number`; session token остаётся недоступен JavaScript.
+Для страницы заказа скопируйте содержимое `examples/tilda-order-page.html` в HTML-код блока Tilda T123, замените единственный placeholder `API_BASE`, а страницу опубликуйте по URL из `CUSTOMER_ORDER_PAGE_URL`. Пример читает только публичный `number` из query string, делает credentialed request, создаёт DOM через `textContent`/`createElement` и показывает защищённые ссылки просмотра/скачивания invoice. Пока invoice имеет статус `pending`, пример опрашивает customer API раз в 4 секунды, но не более 15 раз; polling прекращается при `generated`, `failed` или timeout. В `localStorage` он сохраняет только `last_order_number`; session token остаётся недоступен JavaScript.
 
 Для production Tilda и API должны работать через HTTPS. При `adrosta.ru` → `api.adrosta.ru` они остаются same-site, поэтому `SameSite=Lax` подходит. В `CORS_ALLOWED_ORIGINS` перечислите каждый реальный origin отдельно, например `https://adrosta.ru,https://www.adrosta.ru`; wildcard и отражение произвольного `Origin` запрещены. Preview-origin добавляйте только если он действительно используется и доверен.
 
